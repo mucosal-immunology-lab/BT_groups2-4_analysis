@@ -1,0 +1,124 @@
+---
+title: "Breathing Together Project: G2-4"
+subtitle: "Host Transcriptomics"
+author: "Matthew Macowan"
+date: "`r format(Sys.time())`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    toc_depth: 4
+---
+
+Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Australia.
+
+# Environment setup
+
+## 1) Load packages
+
+```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
+notebook.name <- 'BT_host_transcriptomics_analysis'
+
+# Get R version and OS information
+R.version$version.string
+R.version$platform
+
+# Load R packages
+pkgs <- c('knitr', 'here', 'SummarizedExperiment', 'biomaRt', 'edgeR', 'limma')
+
+pacman::p_load(char = pkgs)
+
+for (pkg in pkgs) {
+  print(paste0(pkg, ': ', packageVersion(pkg)))
+}
+
+# Set seed
+set.seed(2)
+```
+
+## 2) Process data and prepare matrix for multi-omics
+
+The RNA sequencing raw fastq files have been processed using the [NF-CORE rnaseq pipeline](https://nf-co.re/rnaseq).
+Briefly, reads undergo initial QC with FastQC, UMIs are extracted with UMI-tools, and reads undergo adapter removal and quality trimming using Trim Galore!
+Next, genomic contaminants are removed via BBSplit, and ribosomal components are removed via SortMeRNA.
+Reads are aligned and quantified via a combination of STAR and Salmon tools, and sorted and indexed using SAMtools and dereplicated via UMI-tools.
+Outputs are provided in `.rds` file format as SummarizedExperiment objects, with bias-corrected gene counts without an offset (`salmon.merged.gene_counts_length_scaled.rds`).
+
+There are two matrices provided to us: counts and abundance.
+
+- The abundance matrix is the scaled and normalised transcripts per million (TPM) abundance. TPM explicitly erases information about library size. That is, it estimates the relative abundance of each transcript proportional to the total population of transcripts sampled in the experiment. Thus, you can imagine TPM, in a way, as a partition of unity — we want to assign a fraction of the total expression (whatever that may be) to transcript, regardless of whether our library is 10M fragments or 100M fragments.
+- The counts matrix is a re-estimated counts table that aims to provide count-level data to be compatible with downstream tools such as DESeq2.
+- The `tximport` package has a single function for importing transcript-level estimates. The type argument is used to specify what software was used for estimation. A simple list with matrices, `"abundance"`, `"counts"`, and `"length"`, is returned, where the transcript level information is summarized to the gene-level. Typically, abundance is provided by the quantification tools as TPM (transcripts-per-million), while the counts are estimated counts (possibly fractional), and the `"length"` matrix contains the effective gene lengths. The `"length"` matrix can be used to generate an offset matrix for downstream gene-level differential analysis of count matrices.
+
+As such, there are a few things we need to keep in mind:
+
+- For ordination, we should use the TPM data.
+- For limma DE analysis, because limma does not use an offset matrix store in `y$offset`, it is recommended to use the scaled counts generated from abundances, either `"scaledTPM"` or `"lengthScaledTPM"`.
+- For edgeR, you need to generate counts from abundances.
+
+```{r}
+# Import the bias-corrected counts from STAR Salmon
+rna_bronch <- readRDS(here('input', '03_HostTranscriptomics', 'StarSalmon_BronchBrush', 'salmon.merged.gene_counts_length_scaled.rds'))
+
+# Get Ensembl annotations
+ensembl <- useMart('ensembl', dataset = 'hsapiens_gene_ensembl')
+
+ensemblIDsBronch <- rownames(rna_bronch)
+
+gene_list <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol', 'gene_biotype'),
+                   filters = 'ensembl_gene_id', values = ensemblIDsBronch, mart = ensembl)
+colnames(gene_list) <- c("gene_id", "hgnc_symbol", "gene_biotype")
+gene_list <- filter(gene_list, !duplicated(gene_id))
+
+# Ensure that only genes in the STAR Salmon outputs are kept for the gene list
+rna_bronch <- rna_bronch[rownames(rna_bronch) %in% gene_list$gene_id, ]
+
+# Add the ENSEMBL data to the rowData element
+rowData(rna_bronch) <- merge(gene_list, rowData(rna_bronch), by = "gene_id", all = FALSE)
+
+# Load the RNA metadata
+metadata_rna <- readRDS(here('input', '00_Metadata', 'metadata_rna_clean.rds'))
+
+# Sort the metadata rows to match the order of the abundance data
+metadata_bronch <- metadata_rna
+rownames(metadata_bronch) <- metadata_bronch$Bronch_RNA_barcode
+metadata_bronch <- metadata_bronch[colnames(rna_bronch),]
+
+# Create a DGEList from the SummarizedExperiment object
+rna_bronch_dge <- DGEList(assay(rna_bronch, 'counts'), 
+                          samples = metadata_bronch, 
+                          group = metadata_bronch$group,
+                          genes = rowData(rna_bronch),
+                          remove.zeros = TRUE)
+
+# Filter the DGEList based on the BT group information
+design_bronch <- model.matrix(~ group, data = rna_bronch_dge$samples)
+keep_bronch_min100 <- filterByExpr(rna_bronch_dge, design_bronch, min.count = 100)
+rna_bronch_dge_min100 <- rna_bronch_dge[keep_bronch_min100, ]
+
+# Calculate norm factors and perform voom normalisation
+rna_bronch_dge_min100 <- calcNormFactors(rna_bronch_dge_min100)
+rna_bronch_dge_min100 <- voom(rna_bronch_dge_min100, design_bronch, plot = TRUE)
+
+# Add the normalised abundance data from STAR Salmon and filter to match the counts data
+rna_bronch_dge_min100$abundance <- as.matrix(assay(rna_bronch, 'abundance'))[keep_bronch_min100, ]
+
+# Select protein coding defined genes only
+rna_bronch_dge_min100 <- rna_bronch_dge_min100[rna_bronch_dge_min100$genes$gene_biotype == "protein_coding" & rna_bronch_dge_min100$genes$hgnc_symbol != "", ]
+
+# Add symbol as rowname
+rownames(rna_bronch_dge_min100) <- rna_bronch_dge_min100$genes$gene_name
+
+# Save the DGEList
+saveRDS(rna_bronch_dge_min100, here('input', '03_HostTranscriptomics', 'rna_bronch_dge_min100.rds'))
+
+# Prepare the voom-corrected gene expression data for MOFA+
+# We need to add an 'S' to the beginning of the samples as they shouldn't start with numeric values
+host_rna_bronch_matrix_min100 <- rna_bronch_dge_min100$E
+colnames(host_rna_bronch_matrix_min100) <- paste0('S', rna_bronch_dge_min100$targets$Subject)
+host_rna_bronch_matrix_min100 <- host_rna_bronch_matrix_min100[, !colnames(host_rna_bronch_matrix_min100) %in% outliers]
+
+# Save the matrix for multi-omics
+saveRDS(host_rna_bronch_matrix_min100, here('input', '06_MOFA', 'host_rna_bronch_matrix_min100.rds'))
+```
