@@ -1,0 +1,338 @@
+---
+title: "Breathing Together Project: G2-4"
+subtitle: "Bronchial Brush Metagenomes"
+author: "Matthew Macowan"
+date: "`r format(Sys.time())`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    toc_depth: 4
+---
+
+Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Australia.
+
+# Environment setup
+
+## 1) Load packages
+
+```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
+notebook.name <- 'breathing_together_metagenomics'
+
+# Get R version and OS information
+version$version.string
+version$platform
+
+# Load R packages
+pkgs <- c('knitr', 'here', 'readr', 'tidyverse', 'dplyr', 'tibble',
+          'tidyr', 'phyloseq', 'phylotools')
+
+pacman::p_load(char = pkgs)
+
+for (pkg in pkgs) {
+  print(paste0(pkg, ': ', packageVersion(pkg)))
+}
+
+# Set seed
+set.seed(2)
+
+# Set up parallel
+cores <- detectCores() - 2
+cl <- makeCluster(cores)
+registerDoParallel(cl = cl)
+```
+
+# Data processing
+
+## 1) Mapped files and read counts
+
+```{r}
+# Recover metadata
+metaG_metadata <- readRDS(here('input', '00_Metadata', 'metagenomics_metadata.rds'))
+
+# Set base file path of alignment read counts
+base_fp <- here('input', '01_Metagenomics', '01_Anvio', 'mapping', 'alignment_counts')
+
+# Read files into a list
+alignment_counts_filenames <- list.files(path = base_fp, pattern = '.txt')
+alignment_counts_raw <- list()
+for (file in alignment_counts_filenames) {
+  sample_name <- gsub('.bam_RNAME.txt', '', file)
+  alignment_counts_raw[[sample_name]] <- read_table(here(base_fp, file), col_types = 'nc') %>%
+    mutate(sample = sample_name)
+}
+
+# Reformat list into a single wide data.frame
+alignment_counts <- do.call(rbind, alignment_counts_raw) %>%
+  remove_rownames() %>%
+  pivot_wider(names_from = 'sample', values_from = 'count') %>%
+  replace(is.na(.), 0)  %>% # fill in all the gaps with zero
+  mutate(contig_num = as.numeric(gsub('c_0*', '', RNAME))) %>% # create column to order contigs numerically
+  arrange(contig_num) %>%
+  dplyr::select(-contig_num) %>%
+  column_to_rownames(var = 'RNAME')
+
+# Match column order to metadata
+alignment_counts <- alignment_counts[, colnames(alignment_counts) %in% rownames(metaG_metadata)]
+metaG_metadata <- metaG_metadata[colnames(alignment_counts), ]
+rownames(metaG_metadata) <- metaG_metadata$Bronch_DNA_barcode
+identical(colnames(alignment_counts), rownames(metaG_metadata))
+
+# Generate a taxonomy table for the contig data
+contig_df <- data.frame('contig_id' = rownames(alignment_counts)) %>%
+  left_join(read_csv(here('input', '01_Metagenomics', '01_Anvio', 'external-binning-results', 'contigs-fixed-BusyBee',
+                          'taxonomy', 'contigs-fixed-kraken.csv')))
+rownames(contig_df) <- contig_df$contig_id
+
+# Assemble contig counts into a phyloseq object
+OTU <- otu_table(alignment_counts, taxa_are_rows = TRUE)
+META <- sample_data(metaG_metadata)
+sample_names(META) <- colnames(alignment_counts)
+TAX <- tax_table(as.matrix(contig_df))
+
+contig_data_raw <- phyloseq(OTU, META, TAX)
+
+# Save the phyloseq
+saveRDS(contig_data_raw, here(base_fp, 'contig_alignment_counts_ps.rds'))
+```
+
+## 2) Decontamination
+
+To do this, we will remove any contigs that are present in the negative controls.
+In the phyloseq object, the `'BT_group'` column contains information on positive and negative controls. 
+We'll summarise that data as a logical variable, with TRUE for negative controls, and highlight any contigs present in the negative controls for removal.
+
+```{r}
+# Recover phyloseq object
+base_fp <- here('input', '01_Metagenomics', '01_Anvio', 'mapping', 'alignment_counts')
+contig_data_raw <- readRDS(here(base_fp, 'contig_alignment_counts_ps.rds'))
+
+# Get the contig counts per sample before decontamination
+pre_decontam_colsums <- colSums(contig_data_raw@otu_table)
+
+# Re-identify the negative controls and as a logical TRUE/FALSE variable
+sample_data(contig_data_raw)$is_neg <- sample_data(contig_data_raw)$BT_group == '5_Negative_control'
+
+# Subset the phyloseq for just the negative controls
+contig_data_negctrl <- subset_samples(contig_data_raw, sample_data(contig_data_raw)$is_neg)
+
+# Identify contigs with reads present in the negative controls, and make a KEEP vector
+contigs_keep <- rowSums(otu_table(contig_data_negctrl)) == 0
+
+ # Check how many contaminant contigs are identified (i.e. FALSE count)
+(tf <- table(contigs_keep))
+
+# Remove contaminants
+contig_data_clean <- subset_taxa(contig_data_raw, contigs_keep)
+
+# Get the contig counts per sample after decontamination
+post_decontam_colsums <- colSums(contig_data_clean@otu_table)
+
+# Keep only samples
+contig_data_clean <- subset_samples(contig_data_clean, is_neg == FALSE)
+
+# Make a data.frame with the contaminant percentages
+contaminant_ratios <- data.frame(pre_decontam = pre_decontam_colsums) %>%
+  rownames_to_column(var = 'barcode') %>%
+  left_join(data.frame(post_decontam = post_decontam_colsums) %>% rownames_to_column(var = 'barcode'), by = 'barcode') %>%
+  mutate(not_contaminant = post_decontam / pre_decontam * 100, # percentage on non-contaminant reads
+         BT_group = sample_data(contig_data_raw)$BT_group) # the Breathing Together group
+saveRDS(contaminant_ratios, here('output', '01_Metagenomics', '01_Decontamination', 'contamination_ratios_data.rds'))
+
+# Add the non-contaminant percentage to the sample data
+c_ratio <- filter(contaminant_ratios, !str_detect(barcode, 'ExtrNegCtrl'))
+sample_data(contig_data_clean)$non_contaminant_perc <- c_ratio$not_contaminant
+
+# Save the clean phyloseq object
+saveRDS(contig_data_clean, here('output', '01_Metagenomics', '01_Decontamination', 'contig_data_clean.rds'))
+```
+
+### 3) Filter co-assembled contigs
+
+Here we will filter the contigs to remove the contaminants identified above.
+
+```{r}
+# Read in the contigs file
+contigs_fixed <- phylotools::read.fasta(file = here('input', '01_Metagenomics', '01_Anvio', 'contigs-fixed.fa'))
+
+# Filter the contigs using the contig IDs from your decontaminated phyloseq
+contigs_to_keep <- as.vector(tax_table(contig_data_clean)[,1])
+contigs_fixed <- contigs_fixed %>%
+  dplyr::filter(seq.name %in% contigs_to_keep)
+saveRDS(contigs_fixed, here('output', '01_Metagenomics', '01_Decontamination', 'contigs_fixed_fasta_df.rds'))
+
+# Rewrite the contigs back to FASTA format
+phylotools::dat2fasta(contigs_fixed, here('input', '01_Metagenomics', '01_Anvio', 'contigs-clean.fa'))
+```
+
+### 4) Filter samples to retain
+
+```{r}
+# Recover clean contigs phyloseq
+contig_data_clean <- readRDS(here('output', '01_Metagenomics', '01_Decontamination', 'contig_data_clean.rds'))
+
+# Filter at a threshold of 90% non-contaminant reads and save to RDS
+contig_data_contam90 <- subset_samples(contig_data_clean, sample_data(contig_data_clean)$non_contaminant_perc > 90)
+saveRDS(contig_data_contam90, here('output', '01_Metagenomics', '01_Decontamination', 'contig_data_contam90.rds'))
+```
+
+### 5) GhostKOALA: KEGG mapper
+
+The clean co-assembly file is used to within Anvi'o to build a contigs database, from which the amino acid 
+sequences for each gene call can be retrieved and used as input for the GhostKOALA tool for mapping of 
+functional KEGG ortholog assignments. These steps can be found [here](https://github.com/mucosal-immunology-lab/microbiome-analysis/wiki/Anvio-pipeline).
+The GhostKOALA tool is available at [https://www.kegg.jp/ghostkoala/](https://www.kegg.jp/ghostkoala/).
+
+```{r}
+# Recover the contig data phyloseqs
+contig_data_contam90 <- readRDS(here('output', '01_Metagenomics', '01_Decontamination', 'contig_data_contam90.rds'))
+
+# Import GhostKOALA data
+gk_raw_90 <- read_tsv(here('input', '01_Metagenomics', '01_Anvio', 'contam90', 'ghostkoala', 'ghost-koala-results-contam90.txt')) %>%
+  dplyr::select(-source, -e_value)
+colnames(gk_raw_90) <- c('gene_callers_id', 'GhostKOALA_accession', 'GhostKOALA_function')
+
+# Extract sample data object and add the GhostKOALA annotations
+# Also add a column, 'ID', that combines the species and GhostKOALA accession for phyloseq agglomeration downstream
+contig_tax_table_contam90 <- data.frame(tax_table(contig_data_contam90)) %>%
+  mutate(gene_callers_id = as.numeric(gsub('c_[0]*', '', contig_id))) %>%
+  left_join(gk_raw_90, by = 'gene_callers_id') %>%
+  mutate(deepest_tax = case_when(
+    !is.na(Species) ~ Species,
+    !is.na(Genus) ~ Genus,
+    !is.na(Family) ~ Family,
+    !is.na(Order) ~ Order,
+    !is.na(Class) ~ Class,
+    !is.na(Phylum) ~ Phylum,
+    .default = 'Unknown'
+  )) %>%
+  mutate(ID = paste(deepest_tax, GhostKOALA_accession, sep = '_')) %>%
+  dplyr::select(contig_id, Kingdom, Phylum, Class, Order, Family, Genus, Species, deepest_tax, ID, GhostKOALA_accession, GhostKOALA_function)
+
+# Add data to a new phyloseq
+contig_data_contam90_gk <- contig_data_contam90
+contam90_gk_tax_table <- data.frame(contig_tax_table_contam90, row.names = contig_tax_table_contam90$contig_id) %>%
+  as.matrix()
+tax_table(contig_data_contam90_gk) <- tax_table(contam90_gk_tax_table)
+
+# Filter for contigs with an associated GhostKOALA match
+contig_data_contam90_gk <- subset_taxa(contig_data_contam90_gk, !is.na(tax_table(contig_data_contam90_gk)[, 'GhostKOALA_accession']))
+
+# Save the RDS
+saveRDS(contig_data_contam90_gk, here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'contig_data_contam90_gk.rds'))
+```
+
+### 6) Data preparation for multi-omics
+
+#### a) Taxonomic stratification
+
+Because it is more than likely that KEGG ortholog (KO) assignments with be the same for more than one contig,
+we will now identify taxa-KO pairs, and use these to agglomerate the data by adding their counts together.
+In this way, we will generate a taxa-stratified dataset for downstream analysis.
+
+```{r}
+# Recover shotgun metagenomics raw count data
+contig_data_contam90_gk <- readRDS(here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'contig_data_contam90_gk.rds'))
+
+# Add 'S' to each sample name so that they don't begin with a numeric value
+sample_names(contig_data_contam90_gk) <- paste0('S', sample_data(contig_data_contam90_gk)$Subject)
+
+# Define a function to aggregate data using the Species/GhostKOALA accession pair
+tax_aggregate <- function(phyloseq_object, taxrank = NA) {
+  # Extract OTU table and add the Species/GhostKOALA accession pair to a new column
+  # Then group by that column, add the read counts together, and move the column to the rownames
+  otu_table <- data.frame(otu_table(phyloseq_object)) %>%
+    remove_rownames() %>%
+    mutate(ID = as.character(tax_table(phyloseq_object)[, taxrank])) %>%
+    group_by(ID) %>%
+    summarise(across(where(is.numeric), .fns = sum)) %>%
+    ungroup() %>%
+    replace_na(replace = list(ID = 'Unknown')) %>%
+    column_to_rownames(var = 'ID')
+  # Aggregate the tax table according to the desired taxrank column
+  if (taxrank == 'ID') {
+    tax_table <- data.frame(tax_table(phyloseq_object)) %>%
+    remove_rownames() %>%
+    group_by(.data[[taxrank]]) %>%
+    summarise(contig_id = paste(contig_id, collapse = ';'),
+              GhostKOALA_accession = paste(GhostKOALA_accession, collapse = '%'), 
+              GhostKOALA_function = paste(GhostKOALA_function, collapse = '%')) %>%
+    mutate(GhostKOALA_accession = gsub('%.*', '', GhostKOALA_accession),
+           GhostKOALA_function = gsub('%.*', '', GhostKOALA_function)) %>%
+    dplyr::select(contig_id, GhostKOALA_accession, GhostKOALA_function, .data[[taxrank]])
+  } else {
+    tax_table <- data.frame(tax_table(phyloseq_object)) %>%
+      remove_rownames() %>%
+      group_by(.data[[taxrank]]) %>%
+      summarise(contig_id = paste(contig_id, collapse = ';'),
+                GhostKOALA_accession = paste(GhostKOALA_accession, collapse = '%'), 
+                GhostKOALA_function = paste(GhostKOALA_function, collapse = '%'),
+                Phylum = paste(Phylum, collapse = '%'),
+                Order = paste(Order, collapse = '%'),
+                Class = paste(Class, collapse = '%'),
+                Family = paste(Family, collapse = '%')) %>%
+      mutate(Phylum = gsub('%.*', '', Phylum),
+             Order = gsub('%.*', '', Order),
+             Class = gsub('%.*', '', Class),
+             Family = gsub('%.*', '', Family)) %>%
+      dplyr::select(contig_id, GhostKOALA_accession, GhostKOALA_function, 
+                    Phylum, Order, Class, Family, .data[[taxrank]])
+  }
+  # Assemble the elements to regenerate the phyloseq object
+  OTU <- otu_table(otu_table, taxa_are_rows = TRUE)
+  TAX <- tax_table(as.matrix(tax_table))
+  taxa_names(TAX) <- taxa_names(OTU)
+  SAM <- sample_data(phyloseq_object)
+  PHYSEQ <- phyloseq(OTU, TAX, SAM)
+  # Return the phyloseq
+  return(PHYSEQ)
+}
+
+# Agglomerate data to the ID level, i.e. the combination of Species and GhostKOALA accession
+contig_glom_contam90_gk <- tax_aggregate(contig_data_contam90_gk, taxrank = 'ID')
+
+# Save the resulting phyloseq object
+saveRDS(contig_glom_contam90_gk, here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'contig_glom_contam90_gk.rds'))
+```
+
+#### b) Filtering and normalisation
+
+```{r}
+# Recover the phyloseq objects
+contig_glom_contam90_gk <- readRDS(here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'contig_glom_contam90_gk.rds'))
+
+# Check the group sizes
+contam90_smallestgroup <- min(table(sample_data(contig_glom_contam90_gk)$BT_group))
+
+contam90_samplesize <- length(sample_data(contig_glom_contam90_gk)$BT_group)
+
+# Set the prevalence threshold so that it is equal to half of the smallest group size
+contam90_prevalence_threshold <- round(((contam90_smallestgroup / contam90_samplesize) / 2), 1)
+
+# Filter the data
+metaG_filtered <- core(contig_glom_contam90_gk,
+                       detection = 1,
+                       prevalence = contam90_prevalence_threshold,
+                       include.lowest = FALSE)
+
+# Run CLR normalisation
+metaG_CLR <- metaG_filtered
+otu_table(metaG_CLR) <- microbiome::transform(otu_table(metaG_CLR, transform = 'clr'))
+
+# Save the normalised phyloseq object
+saveRDS(metaG_CLR, here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'metaG_CLR.rds'))
+```
+
+#### c) Matrix preparation
+
+```{r}
+# Retrieve datasets
+metaG_CLR <- readRDS(here('input', '01_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'metaG_CLR.rds'))
+
+# Extract and prepare the matrix for MOFA+
+metaG_CLR_matrix <- as.matrix(data.frame(otu_table(metaG_CLR), row.names = tax_table(metaG_CLR)[, 'ID']))
+
+# Save the matrix file
+saveRDS(metaG_CLR_matrix, here('input', '06_MOFA', 'metaG_CLR_matrix.rds'))
+```
