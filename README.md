@@ -11,19 +11,19 @@ For context, the groups are as follows:
 <img src="./assets/BTg2-4_pipeline.png" width=75%>
 
 - [Multi-omic data analysis of groups 2-4 of the Breathing Together study](#multi-omic-data-analysis-of-groups-2-4-of-the-breathing-together-study)
-  - [Host RNA sequencing data processing](#host-rna-sequencing-data-processing)
+  - [1) Host RNA sequencing data processing](#1-host-rna-sequencing-data-processing)
     - [Cluster steps](#cluster-steps)
     - [R steps](#r-steps)
-  - [Bacterial DNA sequencing data processing](#bacterial-dna-sequencing-data-processing)
+  - [2) Bacterial DNA sequencing data processing](#2-bacterial-dna-sequencing-data-processing)
     - [Cluster steps](#cluster-steps-1)
-  - [Bacterial RNA metatranscriptomic sequencing data processing](#bacterial-rna-metatranscriptomic-sequencing-data-processing)
+  - [3) Bacterial RNA metatranscriptomic sequencing data processing](#3-bacterial-rna-metatranscriptomic-sequencing-data-processing)
     - [Mapping data to clean metagenomic coassembly sequences](#mapping-data-to-clean-metagenomic-coassembly-sequences)
     - [Correlation analysis between metagenomic and metatranscriptomic data](#correlation-analysis-between-metagenomic-and-metatranscriptomic-data)
-  - [Bronchoalveolar lavage (BAL) LCMS data processing](#bronchoalveolar-lavage-bal-lcms-data-processing)
-  - [Multi-omic integration with MOFA+](#multi-omic-integration-with-mofa)
+  - [4) Bronchoalveolar lavage (BAL) LCMS data processing](#4-bronchoalveolar-lavage-bal-lcms-data-processing)
+  - [5) Multi-omic integration with MOFA+](#5-multi-omic-integration-with-mofa)
 
 
-## Host RNA sequencing data processing
+## 1) Host RNA sequencing data processing
 
 ### Cluster steps
 
@@ -35,7 +35,7 @@ An RMarkdown file with the R-based data processing is provided [here](./01_HostT
 
 <img src="./assets/nf-core-rnaseq_metro_map_grey.png">
 
-## Bacterial DNA sequencing data processing
+## 2) Bacterial DNA sequencing data processing
 
 Raw shotgun sequencing reads were processed as previously described using the [Sunbeam pipeline](https://sunbeam.readthedocs.io/en/stable/) for adaptor trimming, quality control (QC), host genome decontamination, assembly of contiguous sequences, and co-assembly. Contig taxonomy was estimated using [Kraken 2](https://ccb.jhu.edu/software/kraken2/).
 
@@ -89,7 +89,7 @@ The following steps are provided in an [RMarkdown file](./02_Metagenomics.Rmd). 
 
 The dataset was then agglomerated using taxonomy to produce taxa-KO pairs with their associated counts. Using the R [microbiome](https://bioconductor.org/packages/release/bioc/html/microbiome.html) package (version 1.22.0), the dataset was filtered using a detection threshold of 1 in at least 10% of samples via the core function, and centralised log-ratio (CLR)-normalised via the transform function. The final dataset was saved as a matrix for multi-omic data integration.
 
-## Bacterial RNA metatranscriptomic sequencing data processing
+## 3) Bacterial RNA metatranscriptomic sequencing data processing
 
 ### Mapping data to clean metagenomic coassembly sequences
 
@@ -103,7 +103,7 @@ Normalised metagenomic and metatranscriptomic contig data were separately strati
 
 An [R Markdown file](./03_Metatranscriptomics.Rmd) is provided to show the steps.
 
-## Bronchoalveolar lavage (BAL) LCMS data processing
+## 4) Bronchoalveolar lavage (BAL) LCMS data processing
 
 Raw LCMS data from both metabolomic and lipidomic samples run on a Q-Exactive Orbitrap mass spectrometer (Thermo Fisher) were processed using the [metabolome-lipidome-MSDIAL pipeline](https://github.com/respiratory-immunology-lab/metabolome-lipidome-MSDIAL), incorporating [MS-DIAL (version 5.1)](http://prime.psc.riken.jp/compms/msdial/main.html), the [human metabolome database (HMDB, version 4 - July 2021)](https://hmdb.ca/), and the [pmp](https://bioconductor.org/packages/release/bioc/html/pmp.html) (version 1.4.0) R package. Please visit the [pipeline](https://github.com/respiratory-immunology-lab/metabolome-lipidome-MSDIAL) for complete details.
 
@@ -111,7 +111,7 @@ An [R Markdown file](./04_SmallMolecules.Rmd) is provided showing the steps used
 
 The final dataset was saved as a matrix for multi-omic data integration.
 
-## Multi-omic integration with MOFA+
+## 5) Multi-omic integration with MOFA+
 
 An [R Markdown file](./05_Multiomics.Rmd) of the following steps is provided. The three input matrices were assembled into a [MultiAssayExperiment](https://github.com/waldronlab/MultiAssayExperiment) object. Data was integrated using Multi-Omics Factor Analysis [(MOFA)](https://biofam.github.io/MOFA2/), with slow convergence, a seed value of 2 for generation of pseudo-random numbers, 5% minimum explained variance threshold for factor retention, and sampling age used as a covariate. As model inputs, we supplied voom-normalised host transcriptomics data with a read count threshold of 100, centralised log-ratio (CLR)-normalised metagenomic KEGG ortholog count data with a detection threshold of 1 in >10% of samples, and a combined small molecules dataset. Wilcoxon rank sum tests were used to assess categorical differences in the resulting latent factors, and Spearman correlation analyses were used to assess continuous variables.
 
