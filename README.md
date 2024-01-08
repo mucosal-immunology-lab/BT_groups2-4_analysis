@@ -5,7 +5,7 @@ Here we present the data processing and subsequent multi-omic integration and an
 For context, the groups are as follows:
 
 * **Group 2**: healthy preschool-aged controls
-* **Group 3**: preschool children with severe wheeze
+* **Group 3**: preschool children with severe recurrent wheeze
 * **Group 4**: school-aged children diagnosed with asthma
 
 <img src="./assets/BTg2-4_pipeline.png" width=75%>
