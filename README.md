@@ -8,6 +8,8 @@ For context, the groups are as follows:
 * **Group 3**: preschool children with severe wheeze
 * **Group 4**: school-aged children diagnosed with asthma
 
+<img src="./assets/BTg2-4_pipeline.png" width=75%>
+
 - [Multi-omic data analysis of groups 2-4 of the Breathing Together study](#multi-omic-data-analysis-of-groups-2-4-of-the-breathing-together-study)
   - [Host RNA sequencing data processing](#host-rna-sequencing-data-processing)
     - [Cluster steps](#cluster-steps)
