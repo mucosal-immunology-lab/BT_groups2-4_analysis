@@ -1,0 +1,301 @@
+---
+title: "Breathing Together Project"
+subtitle: "Bronchial Brush Metatranscriptomes"
+author: "Matthew Macowan"
+date: "`r format(Sys.time())`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    toc_depth: 4
+---
+
+Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Australia.
+
+# Context
+
+We have metatranscriptomics data from preschool controls, preschool wheezers, and school-aged wheezers.
+
+# Environment setup
+
+### Load packages
+
+```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
+# Get R version and OS information
+version$version.string
+version$platform
+
+#devtools::install_github("yogevherz/plotme")
+
+# Load R packages
+pkgs <- c('knitr', 'here', 'ggplot2', 'tidyverse', 'ggpubr', 'ggsci', 'ggbeeswarm', 'compositions',
+          'rstatix', 'purrr', 'phyloseq', 'decontam', 'phylotools', 'microbiome', 'metagenomeSeq',
+          'plotly', 'plotme', 'htmlwidgets', 'ggside', 'factoextra', 'pathfindR', 'clusterProfiler',
+          'KEGGREST', 'org.EcK12.eg.db', 'foreach', 'parallel', 'doParallel', 'pathview', 'ggpmisc',
+          'vegan', 'drc', 'strucchange')
+
+pacman::p_load(char = pkgs, lib.loc = '/home/matthew/R/x86_64-pc-linux-gnu-library/4.2')
+
+for (pkg in pkgs) {
+  print(paste0(pkg, ': ', packageVersion(pkg)))
+}
+
+# Set seed
+set.seed(2)
+
+# Set up parallel
+cores <- detectCores() - 2
+cl <- makeCluster(cores)
+registerDoParallel(cl = cl)
+
+# Set BT group colours
+bt_cols <- c('2_Preschool_control' = 'darkseagreen3', 
+             '3_Preschool_wheeze' = 'orange3',
+             '4_School_asthma' = 'indianred')
+
+# Load custom scripts
+source(here::here('scripts', 'rotate_df.R'))
+source(here::here('scripts', 'remove_zeroRows.R'))
+source(here::here('scripts', 'plot_list_to_pdf.R'))
+source(here::here('scripts', 'kraken2_preprocess.R'))
+source(here::here('scripts', 'kraken2_phyloseq.R'))
+```
+
+## 1) Generate phyloseq for RNA data
+
+```{r}
+# Recover contam90 GK dataset
+contig_data_contam90_gk <- readRDS(here('input', '02_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'contig_data_contam90_gk.rds'))
+
+# Set base file path of alignment read counts
+base_fp <- here('input', '03_Metatranscriptomics', 'mapping_counts')
+
+# Read files into a list
+alignment_counts_filenames <- list.files(path = base_fp, pattern = '.txt')
+alignment_counts_raw <- list()
+for (file in alignment_counts_filenames) {
+  sample_name <- gsub('_RNAME.txt', '', file)
+  alignment_counts_raw[[sample_name]] <- read_table(here(base_fp, file), col_types = 'nc') %>%
+    mutate(sample = sample_name)
+}
+
+# Reformat list into a single wide data.frame
+alignment_counts <- do.call(rbind, alignment_counts_raw) %>%
+  remove_rownames() %>%
+  pivot_wider(names_from = 'sample', values_from = 'count') %>%
+  replace(is.na(.), 0)  %>% # fill in all the gaps with zero
+  mutate(contig_num = as.numeric(gsub('c_0*', '', RNAME))) %>% # create column to order contigs numerically
+  arrange(contig_num) %>%
+  dplyr::select(-contig_num) %>%
+  column_to_rownames(var = 'RNAME')
+
+# Match column order to metadata
+metadata <- readRDS(here('input', '00_Metadata', 'metadata_mofa.rds'))
+metadata_metaT <- metadata[metadata$Bronch_RNA_barcode %in% colnames(alignment_counts),]
+rownames(metadata_metaT) <- metadata_metaT$Bronch_RNA_barcode
+alignment_counts <- alignment_counts[, rownames(metadata_metaT)]
+colnames(alignment_counts) <- paste0('S', metadata_metaT$Subject)
+rownames(metadata_metaT) <- paste0('S', metadata_metaT$Subject)
+identical(colnames(alignment_counts), rownames(metadata_metaT))
+
+# Match the metaG "taxonomy" table to the metaT data
+metaG_taxtable <- data.frame(tax_table(contig_data_contam90_gk))
+metaT_taxtable <- metaG_taxtable[rownames(alignment_counts),] %>%
+  filter(!is.na(contig_id))
+alignment_counts <- alignment_counts[rownames(metaT_taxtable),]
+
+# Assemble contig counts into a phyloseq object
+OTU <- otu_table(alignment_counts, taxa_are_rows = TRUE)
+META <- sample_data(metadata_metaT)
+sample_names(META) <- colnames(alignment_counts)
+TAX <- tax_table(as.matrix(metaT_taxtable))
+taxa_names(TAX) <- metaT_taxtable$contig_id
+
+bact_metaT_raw <- phyloseq(OTU, META, TAX)
+
+saveRDS(bact_metaT_raw, here('output', '03_Metatranscriptomics', 'bact_metaT_counts_ps.rds'))
+```
+
+### a) Normalisation
+
+```{r}
+# Perform centred log ratio transformation
+bact_metaT_CLR <- microbiome::transform(bact_metaT_raw, transform = 'clr')
+saveRDS(bact_metaT_CLR, here::here('output', '03_Metatranscriptomics', 'bact_metaT_CLR.rds'))
+```
+
+## 2) Correlation between metaT and metaG data
+
+Here we are interested in determining whether the bacteria we see present in our metagenomics (metaG) dataset are transcriptionally active.
+We aim here to determine that using the metatranscriptomics (metaT) dataset.
+
+### a) Separate phyloseq into constitutive taxa
+
+Firstly we will split the metaT dataset into taxa-specific phyloseq objects containing all the information for individual bacteria.
+
+```{r}
+# Recover metaT datasets
+bact_metaT_CLR <- readRDS(here('output', '03_Metatranscriptomics', 'bact_metaT_CLR.rds'))
+
+# Recover the filtered, normalised metaG dataset
+bact_metaG_CLR <- readRDS(here('input', '02_Metagenomics', '02_GhostKoala', '01_PhyloseqObjects', 'bact_metaG_CLR.rds'))
+
+# Determine the individual taxa
+metaT_taxa <- unique(as.character(tax_table(bact_metaT_counts)[, 'deepest_tax']))
+metaT_taxa <- metaT_taxa[!str_count(metaT_taxa, '_') > 1] # Remove candidate taxonomic classifications
+
+# Repeat this process for the metaG dataset
+metaG_tax_table <- data.frame(tax_table(metaG_CLR)) %>%
+  mutate(deepest_tax = gsub('_.*', '', rownames(tax_table(metaG_CLR))))
+tax_table(metaG_CLR) <- tax_table(as.matrix(metaG_tax_table))
+metaG_taxa <- unique(as.character(tax_table(metaG_CLR)[, 'deepest_tax']))
+
+# Find the common taxa
+common_taxa <- intersect(metaT_taxa, metaG_taxa)
+
+# Loop through the phyloseq and split
+metaT_CLR_taxlist <- list()
+for (taxa in common_taxa) {
+  tax_CLR <- prune_taxa(as.character(tax_table(bact_metaT_CLR)[, 'deepest_tax']) == taxa, bact_metaT_CLR)
+  metaT_CLR_taxlist[[taxa]] <- tax_CLR
+}
+saveRDS(metaT_CLR_taxlist, here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_CLR_taxlist.rds'))
+
+# Repeat for the metaG data
+metaG_CLR_taxlist <- list()
+for (taxa in common_taxa) {
+  tax_CLR <- prune_taxa(as.character(tax_table(metaG_CLR)[, 'deepest_tax']) == taxa, metaG_CLR)
+  metaG_CLR_taxlist[[taxa]] <- tax_CLR
+}
+saveRDS(metaG_CLR_taxlist, here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaG_CLR_taxlist.rds'))
+```
+
+### b) Taxa-wise correlation between metaT and metaG data
+
+Now that we have our taxa-split datasets, we can determine the correlation between metaT and metaG datasets, i.e. determine whether the metaG-detected taxa are transcriptionally active.
+
+```{r}
+# Recover taxa-split phyloseq lists
+metaT_CLR_taxlist <- readRDS(here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_CLR_taxlist.rds'))
+metaG_CLR_taxlist <- readRDS(here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaG_CLR_taxlist.rds'))
+identical(names(metaT_CLR_taxlist), names(metaG_CLR_taxlist))
+
+# Loop through the lists and determine correlations
+metaT_metaG_corrlist <- list(data = list(), plots = list())
+for (i in seq_along(metaT_CLR_taxlist)) {
+  # Retrieve taxa name
+  tax_name <- names(metaT_CLR_taxlist)[i]
+  # Extract OTU data
+  metaT_otu <- data.frame(metaT_CLR_taxlist[[i]]@otu_table)
+  colnames(metaT_otu) <- gsub('X', 'S', colnames(metaT_otu)) # Fix cases where the numeric names were given an 'X' prefix
+  metaG_otu <- data.frame(metaG_CLR_taxlist[[i]]@otu_table)
+  # Find intersecting samples
+  sample_int <- intersect(colnames(metaT_otu), colnames(metaG_otu))
+  # Subset
+  metaT_otu <- metaT_otu[, sample_int]
+  metaG_otu <- metaG_otu[, sample_int]
+  # Prepare colMeans information (we're not interested in correlations at a per-gene level)
+  bact_df <- data.frame(metaT_mean = colMeans(metaT_otu),
+                        metaG_mean = colMeans(metaG_otu))
+  # Run correlation test
+  cortest_res <- cor_test(bact_df, metaT_mean, metaG_mean, method = 'spearman') %>%
+    mutate(taxa = tax_name)
+  metaT_metaG_corrlist$data[[tax_name]] <- cortest_res
+  # Prepare a plot
+  p <- ggplot(bact_df, aes(x = metaG_mean, y = metaT_mean)) +
+    geom_smooth(method = 'lm', formula = 'y ~ x', colour = ifelse(cortest_res$cor > 0, 'red', 'blue')) +
+    geom_point() +
+    labs(title = tax_name,
+         x = 'metaG (CLR mean)',
+         y = 'metaT (CLR mean)') +
+    stat_cor(method = 'spearman', size = 2.5, cor.coef.name = 'rho') +
+    theme_pubr(base_size = 8)
+  metaT_metaG_corrlist$plots[[tax_name]] <- p
+}
+
+# Combine correlation test results
+metaT_metaG_cor_df <- do.call(rbind, metaT_metaG_corrlist$data)
+metaT_metaG_cor_sig_df <- metaT_metaG_cor_df %>%
+  filter(p < 0.05) %>%
+  arrange(desc(cor))
+saveRDS(metaT_metaG_cor_df, here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_metaG_cor_df.rds'))
+
+# Filter plots for the significant correlations
+metaT_metaG_cor_sig_plotlist <- list()
+for (i in metaT_metaG_cor_sig_df$taxa) {
+  metaT_metaG_cor_sig_plotlist[[i]] <- metaT_metaG_corrlist$plots[[i]]
+}
+metaT_metaG_cor_plotlist <- list()
+for (i in metaT_metaG_cor_df$taxa) {
+  metaT_metaG_cor_plotlist[[i]] <- metaT_metaG_corrlist$plots[[i]]
+}
+saveRDS(metaT_metaG_cor_plotlist, here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_metaG_cor_plotlist.rds'))
+
+# Arrange plots
+metaT_metaG_cor_plots_arr <- ggarrange(plotlist = metaT_metaG_cor_plotlist, nrow = 4, ncol = 3)
+plot_list_to_pdf(metaT_metaG_cor_plots_arr, 
+                 here('figures', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_metaG_sig_cor_plots.pdf'),
+                 width = 21, height = 28, units = 'cm')
+```
+
+### c) Inspect correlations for top metaT changing taxa
+
+```{r}
+# Retrieve the top metaT changes along the disease factor
+bact_barplot_df_simple <- readRDS(here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 
+                                       'limmaDA', 'gk_f4_taxa_barplot.rds'))
+
+# Collect the correlation data
+metaT_metaG_cor_df <- readRDS(here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_metaG_cor_df.rds'))
+metaT_metaG_cor_plotlist <- readRDS(here('output', '03_Metatranscriptomics', '01_metaT_metaG_correlation', 'metaT_metaG_cor_plotlist.rds'))
+
+# Combine information from the disease factor changes and metaT/metaG correlation
+bact_f4_metaT_metaG_cor <- bact_barplot_df %>%
+  left_join(metaT_metaG_cor_df %>% dplyr::select(taxa, cor, p), by = c('Species' = 'taxa')) %>%
+  mutate(sig_level = gtools::stars.pval(p),
+         Species = factor(Species, levels = Species)) %>%
+  pivot_longer(cols = c(logcount_midpoint, cor), names_to = 'info', values_to = 'value') %>%
+  mutate(info = factor(info, levels = c('logcount_midpoint', 'cor')),
+         sig_level = ifelse(info == 'logcount_midpoint' | sig_level == ' ', NA, sig_level),
+         p = ifelse(info == 'logcount_midpoint', NA, p)) %>%
+  mutate(fill_colour = case_when(
+    direction == 'Health' & info == 'logcount_midpoint' ~ 'darkseagreen3',
+    direction == 'Disease' & info == 'logcount_midpoint' ~ 'indianred',
+    value < 0 & info == 'cor' & str_detect(sig_level, '\\*') ~ '#4DBBD5FF',
+    value > 0 & info == 'cor' & str_detect(sig_level, '\\*') ~ '#E64B35FF',
+    .default = 'grey70'
+  )) %>%
+  mutate(bar_label = case_when(
+    info == 'cor' & !is.na(sig_level) ~ paste0('p = ', p, ' (', sig_level, ')'),
+    .default = NA
+  ))
+
+# Plot this information
+(gk_f4_taxplot_metaTmetaG_simple <- ggplot(bact_f4_metaT_metaG_cor, aes(x = value, y = Species)) +
+    geom_col(aes(fill = fill_colour)) +
+    geom_text(aes(label = bar_label, 
+                  hjust = ifelse(value > 0, 1, 0)),
+              size = 2.5,
+              nudge_x = ifelse(bact_f4_metaT_metaG_cor$value > 0, -0.025, 0.025)) +
+    scale_fill_identity() +
+    labs(title = 'Factor-associated changes in bacterial genes',
+         subtitle = 'Taxa with >10 DE genes (FDR < 0.05; logFC > 0.25)',
+         x = NULL,
+         y = 'Taxa') +
+    facet_grid(cols = vars(info), scales = 'free', labeller = as_labeller(c('logcount_midpoint' = 'log(DE gene count)',
+                                                                            'cor' = 'metaG/metaT Correlation'))) +
+    theme_pubr())
+ggsave(here('figures', '02_Metatranscriptomics', '01_metaT_metaG_correlation', 'gk_f4_taxa_barplot_metaT_metaG_cor.pdf'),
+       gk_f4_taxplot_metaTmetaG_simple, width = 24, height = 14, units = 'cm')
+
+# Arrange and save the correlation plots for these taxa
+gk_f4_metaTmetaG_corplots <- list()
+for (i in bact_f4_metaT_metaG_cor$Species) {
+  gk_f4_metaTmetaG_corplots[[i]] <- metaT_metaG_cor_plotlist[[i]]
+}
+gk_f4_metaTmetaG_corplots_arr <- ggarrange(plotlist = gk_f4_metaTmetaG_corplots, ncol = 3, nrow = 4)
+plot_list_to_pdf(gk_f4_metaTmetaG_corplots_arr, 
+                 here('figures', '02_Metatranscriptomics', '01_metaT_metaG_correlation', 'gk_f4_taxa_cor_plots_metaT_metaG.pdf'),
+                 width = 21, height = 28, units = 'cm')
+```

@@ -14,6 +14,11 @@ For context, the groups are as follows:
     - [R steps](#r-steps)
   - [Bacterial DNA sequencing data processing](#bacterial-dna-sequencing-data-processing)
     - [Cluster steps](#cluster-steps-1)
+  - [Bacterial RNA metatranscriptomic sequencing data processing](#bacterial-rna-metatranscriptomic-sequencing-data-processing)
+    - [Mapping data to clean metagenomic coassembly sequences](#mapping-data-to-clean-metagenomic-coassembly-sequences)
+    - [Correlation analysis between metagenomic and metatranscriptomic data](#correlation-analysis-between-metagenomic-and-metatranscriptomic-data)
+  - [Bronchoalveolar lavage (BAL) LCMS data processing](#bronchoalveolar-lavage-bal-lcms-data-processing)
+  - [Multi-omic integration with MOFA+](#multi-omic-integration-with-mofa)
 
 
 ## Host RNA sequencing data processing
@@ -52,7 +57,7 @@ cp ../sunbeam_output/assembly/coassembly/all_final_contigs.fa .
 anvi-script-reformat-fasta all_final_contigs.fa -o contigs-fixed.fa -l 500 --simplify-names
 ```
 
-Individual FASTQ files were aligned and mapped to the co-assembly using a [custom script](./map_contigs.sh) built around [bowtie2](https://github.com/BenLangmead/bowtie2). Per-sample contig counts generated using a second [custom bash script](./contig_counts.sh).
+Individual FASTQ files were aligned and mapped to the co-assembly using a [custom script](./map_contigs.sh) built around [bowtie2](https://github.com/BenLangmead/bowtie2). Per-sample contig counts generated using a second [custom bash script](./scripts/contig_counts.sh).
 
 ```bash
 # Build a bowtie2 index from the co-assembly
@@ -81,3 +86,33 @@ count  RNAME
 The following steps are provided in an [RMarkdown file](./02_Metagenomics.Rmd). To decontaminate the contigs, any sequence found in the extraction negative controls was removed. Using the ratio of reads before and after decontamination, samples with >90% non-contaminant reads were retained. A decontaminated co-assembly FASTQ file was generated from the remaining contigs. This clean co-assembly was used to build an Anvi'o contigs database, from which the amino acid sequences for each gene call could be retrieved and used as input for functional KEGG orthology (KO) assignment using the [GhostKOALA](https://www.kegg.jp/ghostkoala/) tool provided by the Kyoto Encyclopedia of Genes and Genomes. The relevant steps for building the database and parsing GhostKOALA assignments can here found in more detail [here](https://github.com/mucosal-immunology-lab/microbiome-analysis/wiki/Anvio-pipeline).
 
 The dataset was then agglomerated using taxonomy to produce taxa-KO pairs with their associated counts. Using the R [microbiome](https://bioconductor.org/packages/release/bioc/html/microbiome.html) package (version 1.22.0), the dataset was filtered using a detection threshold of 1 in at least 10% of samples via the core function, and centralised log-ratio (CLR)-normalised via the transform function. The final dataset was saved as a matrix for multi-omic data integration.
+
+## Bacterial RNA metatranscriptomic sequencing data processing
+
+### Mapping data to clean metagenomic coassembly sequences
+
+In order to allow for assessment of bacterial transcriptional activity, host-decontaminated RNA sequences were mapped to the clean metagenomic coassembly (i.e. the coassembly FASTA file after removal of contaminant sequences) using [bowtie2](https://github.com/BenLangmead/bowtie2) and the custom bash scripts for [mapping](./scripts/map_contigs.sh) and [contig counting](./scripts/contig_counts.sh) as above.
+
+Just as with the metagenomics data, the metatranscriptomic contig counts data was assembled into a phyloseq object, and underwent CLR normalisation.
+
+### Correlation analysis between metagenomic and metatranscriptomic data
+
+Normalised metagenomic and metatranscriptomic contig data were separately stratified at the deepest taxonomic level available. Spearman correlations were then performed between the two taxa-stratified datasets on the mean contig counts per sample (we were not interested at this point in per-gene correlations). A cut-off significance threshold of 0.05 was used to identify significant correlations.
+
+An [R Markdown file](./03_Metatranscriptomics.Rmd) is provided to show the steps.
+
+## Bronchoalveolar lavage (BAL) LCMS data processing
+
+Raw LCMS data from both metabolomic and lipidomic samples run on a Q-Exactive Orbitrap mass spectrometer (Thermo Fisher) were processed using the [metabolome-lipidome-MSDIAL pipeline](https://github.com/respiratory-immunology-lab/metabolome-lipidome-MSDIAL), incorporating [MS-DIAL (version 5.1)](http://prime.psc.riken.jp/compms/msdial/main.html), the [human metabolome database (HMDB, version 4 - July 2021)](https://hmdb.ca/), and the [pmp](https://bioconductor.org/packages/release/bioc/html/pmp.html) (version 1.4.0) R package. Please visit the [pipeline](https://github.com/respiratory-immunology-lab/metabolome-lipidome-MSDIAL) for complete details.
+
+An [R Markdown file](./04_SmallMolecules.Rmd) is provided showing the steps used, as there are some minor variations from the above pipeline, such as not using the `pmp_preprocess()` function to allow incorporation of both metabolomic and lipidomic datasets into a single final "small molecules" dataset. This was done to maximise the number of features in the small molecules dataset to get closer to evenness of feature numbers between omic datasets at the multi-omic integration step.
+
+The final dataset was saved as a matrix for multi-omic data integration.
+
+## Multi-omic integration with MOFA+
+
+An [R Markdown file] of the following steps is provided. The three input matrices were assembled into a [MultiAssayExperiment](https://github.com/waldronlab/MultiAssayExperiment) object. Data was integrated using Multi-Omics Factor Analysis [(MOFA)](https://biofam.github.io/MOFA2/), with slow convergence, a seed value of 2 for generation of pseudo-random numbers, 5% minimum explained variance threshold for factor retention, and sampling age used as a covariate. As model inputs, we supplied voom-normalised host transcriptomics data with a read count threshold of 100, centralised log-ratio (CLR)-normalised metagenomic KEGG ortholog count data with a detection threshold of 1 in >10% of samples, and a combined small molecules dataset. Wilcoxon rank sum tests were used to assess categorical differences in the resulting latent factors, and Spearman correlation analyses were used to assess continuous variables.
+
+Factors that showed significant differences between patient groups were used as predictors for age-corrected linear modelling on the individual MOFA-imputed datasets using a custom script built around limma (i.e. [`bio_limma`](./scripts/bio_limma.R)). Benjamini-Hochberg multiple testing correction was used with a significance threshold of 0.05. Log fold-change threshold was 0.5 for host RNA and small molecules, and 0.25 for bacterial metagenomics.
+
+To summarise bacterial metagenomic changes following linear modelling, KO functional gene counts were stratified by taxa, filtered for a minimum count of 10, and the log-transformed value of the sum of increased (positive) and decreased (negative) gene counts calculated to determine the net change in gene count abundance per taxa along the MOFA factor.

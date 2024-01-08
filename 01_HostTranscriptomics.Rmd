@@ -18,8 +18,6 @@ Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Austra
 ## 1) Load packages
 
 ```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
-notebook.name <- 'BT_host_transcriptomics_analysis'
-
 # Get R version and OS information
 R.version$version.string
 R.version$platform
@@ -59,7 +57,7 @@ As such, there are a few things we need to keep in mind:
 
 ```{r}
 # Import the bias-corrected counts from STAR Salmon
-rna_bronch <- readRDS(here('input', '03_HostTranscriptomics', 'StarSalmon_BronchBrush', 'salmon.merged.gene_counts_length_scaled.rds'))
+rna_bronch <- readRDS(here('input', '01_HostTranscriptomics', 'StarSalmon_BronchBrush', 'salmon.merged.gene_counts_length_scaled.rds'))
 
 # Get Ensembl annotations
 ensembl <- useMart('ensembl', dataset = 'hsapiens_gene_ensembl')
@@ -111,7 +109,7 @@ rna_bronch_dge_min100 <- rna_bronch_dge_min100[rna_bronch_dge_min100$genes$gene_
 rownames(rna_bronch_dge_min100) <- rna_bronch_dge_min100$genes$gene_name
 
 # Save the DGEList
-saveRDS(rna_bronch_dge_min100, here('input', '03_HostTranscriptomics', 'rna_bronch_dge_min100.rds'))
+saveRDS(rna_bronch_dge_min100, here('input', '01_HostTranscriptomics', 'rna_bronch_dge_min100.rds'))
 
 # Prepare the voom-corrected gene expression data for MOFA+
 # We need to add an 'S' to the beginning of the samples as they shouldn't start with numeric values
@@ -120,5 +118,5 @@ colnames(host_rna_bronch_matrix_min100) <- paste0('S', rna_bronch_dge_min100$tar
 host_rna_bronch_matrix_min100 <- host_rna_bronch_matrix_min100[, !colnames(host_rna_bronch_matrix_min100) %in% outliers]
 
 # Save the matrix for multi-omics
-saveRDS(host_rna_bronch_matrix_min100, here('input', '06_MOFA', 'host_rna_bronch_matrix_min100.rds'))
+saveRDS(host_rna_bronch_matrix_min100, here('input', '05_MOFA', 'host_rna_bronch_matrix_min100.rds'))
 ```

@@ -1,0 +1,619 @@
+---
+title: "Breathing Together Project"
+subtitle: "Multiomic Analysis of BT groups 2-4"
+author: "Matthew Macowan"
+date: "`r format(Sys.time())`"
+output:
+  html_document:
+  toc: true
+number_sections: true
+toc_float: true
+toc_depth: 4
+---
+
+Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Australia.
+
+# Environment setup
+
+## 1) Load packages
+
+```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
+# Get R version and OS information
+R.version$version.string
+R.version$platform
+
+# Install packages requiring separate installation
+library(devtools)
+remotes::install_github("GraceYoon/SPRING")
+
+# Load R packages
+pkgs <- c('knitr', 'here', 'ggplot2', 'tidyverse', 'ggpubr', 'ggsci', 'ggbeeswarm', 'compositions',
+          'rstatix', 'purrr', 'phyloseq', 'decontam', 'phylotools', 'microbiome', 'metagenomeSeq',
+          'plotly', 'MOFA2', 'edgeR', 'SummarizedExperiment', 'WGCNA', 'caret', 'scales',
+          'doParallel', 'clusterProfiler', 'org.Hs.eg.db', 'ReactomePA', 'KEGGREST', 'methods',
+          'MultiAssayExperiment', 'reshape', 'ggpmisc', 'ComplexHeatmap', 'glmnet', 'hdi',
+          'seriation', 'circlize', 'ggside', 'SNFtool', 'mogsa', 'CancerSubtypes', 'gdata',
+          'DESeq2', 'matrixStats', 'factoextra', 'psych', 'ggcorrplot', 'kableExtra',
+          'pathfindR', 'FactoMineR', 'factoextra', 'pathview', 'gtools', 'stabs',
+          'ggrepel', 'strex', 'sva')
+
+pacman::p_load(char = pkgs)
+
+for (pkg in pkgs) {
+  print(paste0(pkg, ': ', packageVersion(pkg)))
+}
+
+# Set seed
+set.seed(2)
+
+# Set colours for disease groups
+BT_colours <- c('2_Preschool_control' = 'darkseagreen3',
+                '3_Preschool_wheeze' = 'orange3',
+                '4_School_asthma' = 'indianred',
+                'Control' = 'darkseagreen3',
+                'Wheeze_Asthma' = 'indianred',
+                'Low' = '#015074',
+                'Mid' = '#EFCD93',
+                'High' = '#AC3631')
+
+# Set colours for omics modalities
+omic_colours <- c('bact_gk' = '#00a14b',
+                  'host_rna' = '#29abe2',
+                  'small_mol' = '#fbb03b')
+
+# Load custom scripts
+source(here::here('scripts', 'rotate_df.R'))
+source(here::here('scripts', 'plot_list_to_pdf.R'))
+source(here::here('scripts', 'bio_limma.R'))
+```
+
+# MOFA
+
+## 1) Define MOFA code chunks
+
+In order to make sure that the code is as readable as possible, we will define various code chunks here that define the steps for MOFA downstream.
+
+### a) Prepare MultiAssayExperiment and check distributions
+
+Firstly we need to be able to assemble our data into a MultiAssayExperiment object. We can then check the distribution and skew of the data.
+
+```{r, eval=FALSE}
+# Define the function
+prepare_MAE <- function(omics_list, metadata, plot_subtitle) {
+  omics_list <- omics_list
+  # Ensure unique feature names with maximum length of 50 characters
+  omics_name_mapper <- list()
+  for (i in seq_along(omics_list)) {
+    name_mapper <- data.frame('full_name' = as.character(rownames(omics_list[[i]]))) %>%
+      remove_rownames() %>%
+      mutate(name_short = str_sub(full_name, 1, 48)) %>%
+      mutate(name_short = make.unique(name_short))
+    omics_name_mapper[[i]] <- name_mapper
+    rownames(omics_list[[i]]) <- name_mapper$name_short
+  }
+  # Create a MultiAssayExperiment object
+  omics_mae <- MultiAssayExperiment(experiments = omics_list, colData = DataFrame(metadata))
+  # Loop through datasets and inspect the distributions
+  omics_dist_plots <- list()
+  for (i in seq_along(omics_mae@ExperimentList)) {
+    dataset_name <- names(omics_mae@ExperimentList)[i]
+    data <- melt(omics_mae@ExperimentList[[i]])
+    s <- skew(data$value)
+    title = paste0(dataset_name, ' - skew: ', round(s, 3))
+    p <- ggdensity(data, x = 'value', fill = 'lightgrey', title = title) +
+      labs(subtitle = plot_subtitle) +
+      stat_overlay_normal_density(color = 'red', linetype = 'dashed') +
+      theme(text = element_text(size = 7))
+    omics_dist_plots[[dataset_name]] <- p
+  }
+  omics_dist_plots_arr <- ggarrange(plotlist = omics_dist_plots, ncol = 1)
+  # Combine the necessary items and return as a list
+  return(list(omics_mae = omics_mae,
+              omics_name_mapper = omics_name_mapper,
+              omics_dist_plots = omics_dist_plots_arr))
+}
+```
+
+### b) Running of MOFA and correction of factors
+
+Now we need to prepare the code to run MOFA with the MultiAssayExperiment object we created above.
+
+```{r, eval=FALSE}
+# Define the function
+run_MOFA <- function(omics_mae, drop_factor_threshold, output_file) {
+  # Create the MOFA object from the MultiAssayExperiment
+  MOFAobject <- create_mofa(omics_mae)
+  MOFAobject <- set_covariates(MOFAobject, covariates = 'Age_months')
+  # Generate data overview plot
+  data_overview_plot <- plot_data_overview(MOFAobject)
+  # Set MOFA parameters
+  (DataOptions <- get_default_data_options(MOFAobject))
+  DataOptions$center_groups <- TRUE
+  DataOptions$scale_views <- TRUE
+  DataOptions$scale_groups <- TRUE
+  (ModelOptions <- get_default_model_options(MOFAobject))
+  ModelOptions$num_factors <- 8
+  ModelOptions$spikeslab_factors <- FALSE
+  ModelOptions$spikeslab_weights <- FALSE
+  (TrainOptions <- get_default_training_options(MOFAobject))
+  TrainOptions$maxiter <- 10000 # 10000
+  TrainOptions$drop_factor_threshold <- drop_factor_threshold
+  TrainOptions$seed <- 2
+  TrainOptions$convergence_mode <- 'slow'
+  (MefistoOptions <- get_default_mefisto_options(MOFAobject))
+  # Prepare the MOFA object
+  MOFAobject <- prepare_mofa(MOFAobject,
+                             data_options = DataOptions, 
+                             model_options = ModelOptions, 
+                             training_options = TrainOptions,
+                             mefisto_options = MefistoOptions)
+  # Run MOFA
+  MOFArun <- run_mofa(MOFAobject, outfile = here::here('output', '05_MOFA', '01_MOFArun', 'tmp', 'MOFArun_tmp'), use_basilisk = TRUE)
+  saveRDS(MOFArun, output_file)
+  # Return the MOFA run output
+  return(MOFArun)
+}
+```
+
+### c) Save functions to RDS
+
+```{r, eval=FALSE}
+# Add functions to a list and save to RDS
+custom_MOFA_functions <- list(prepare_MAE = prepare_MAE,
+                              run_MOFA = run_MOFA)
+saveRDS(custom_MOFA_functions, here('input', '05_MOFA', 'custom_MOFA_functions.rds'))
+```
+
+## 2) Run MOFA
+
+Using the code chunks above, we will now run MOFA on our different datasets.
+
+### a) Recover datasets
+
+```{r, eval=FALSE}
+# Recover the different datasets
+host_rna_matrix <- readRDS(here('input', '05_MOFA', 'host_rna_bronch_matrix_min100.rds'))
+metaG_CLR_matrix <- readRDS(here('input', '05_MOFA', 'metaG_CLR_matrix.rds'))
+small_mol_matrix <- readRDS(here('input', '05_MOFA', 'smallmol_matrix.rds'))
+
+# Import the metadata
+metadata_mofa <- readRDS(here('input', '00_Metadata', 'metadata_mofa.rds')) %>%
+  column_to_rownames(var = 'Subject_ID')
+
+# Recover the functions from above
+custom_MOFA_functions <- readRDS(here('input', '06_MOFA', '01_TestingStrategy', 'custom_MOFA_functions.rds'))
+
+# Add the custom functions to the environment using the base R assign function
+for (i in seq_along(custom_MOFA_functions)) {
+  assign(names(custom_MOFA_functions)[i], custom_MOFA_functions[[i]])
+}
+```
+
+### b) Prepare MultiAssayExperiments
+
+We will now prepare a MultiAssayExperiment to combine our datasets into a single object.
+
+```{r, eval=FALSE}
+# Describe the input data to use as a subtitle for the data distribution plots
+test_name <- paste0('hostRNA=min100; ', 
+                    'bactfilt=d1p0.1; ',
+                    'small_mol=full; ',
+                    'factordrop=0.05')
+
+# Create a list with the necessary datasets
+omics_list <- list(host_rna = host_rna_matrix,
+                   bact_gk = metaG_CLR_matrix,
+                   small_mol = small_mol_matrix)
+
+# Use the prepare_MAE function to prepare the MultiAssayExperiment object
+mofa_mae <- prepare_MAE(omics_list = omics_list,
+                        metadata = metadata_mofa,
+                        plot_subtitle = test_name)
+
+# Inspect the distribution plots
+mofa_mae$omics_dist_plots
+```
+
+### c) Run MOFA
+
+Now we have our MultiAssayExperiment, we can actually run MOFA+.
+
+```{r, eval=FALSE}
+# Set file output name for MOFA object
+mofa_output_filename <- here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+
+# Run MOFA data integration on the MultiAssayExperiment
+MOFA <- run_MOFA(omics_mae = mofa_mae$omics_mae,
+                 drop_factor_threshold = 0.05,
+                 output_file = mofa_output_filename)
+```
+
+## 3) Overview of MOFA output
+
+### a) Variance explained
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+
+# Extract variance explained data
+var_exp <- data.frame(MOFA@cache$variance_explained$r2_per_factor$group1) %>%
+  rownames_to_column(var = 'Factor') %>%
+  melt() %>%
+  filter(value > 0.01)
+
+# Plot variance explained by factor
+(var_exp_plot <- ggplot(var_exp, aes(x = Factor, y = value)) +
+    geom_col(aes(fill = variable), position = 'stack') +
+    scale_fill_manual(values = omic_colours, name = 'Omic') +
+    geom_text(aes(label = round(value, 2), group = variable), position = position_stack(vjust = 0.5)) +
+    labs(title = 'Variance explained by MOFA+ factor',
+         y = 'Variance explained (%)') +
+    theme_pubr(legend = 'right'))
+ggsave(here('figures', '05_MOFA', '01_Overview', 'var_explained_plot.pdf'),
+       var_exp_plot, width = 14, height = 12, units = 'cm')
+```
+
+### b) Determine factors associated with sample group and disease progression
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+    rownames_to_column(var = 'Subject_ID') %>%
+    left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+                rownames_to_column(var = 'Subject_ID'),
+              by = 'Subject_ID') %>%
+    column_to_rownames(var = 'Subject_ID')
+
+# Define function to test differences in MOFA factors according to a categorical covariate
+factor_wilcox_test <- function(factor_data, covariate) {
+  factor_colnames <- colnames(factor_data %>% dplyr::select(contains('Factor')))
+  wilcox_list <- list()
+  for (i in factor_colnames) {
+    w <- wilcox_test(data = factor_data, formula = as.formula(paste0(i, ' ~ ', covariate)))
+    wilcox_list[[i]] <- w
+  }
+  wilcox_list <- do.call(rbind, wilcox_list)
+}
+
+# BT group
+bt_group_wilcox <- factor_wilcox_test(factor_data, 'BT_group') %>%
+    arrange(p.adj) %>%
+    mutate(comparison = paste0(group1, ' vs. ', group2)) %>% 
+    dplyr::select(-group1, -group2) %>%
+    dplyr::select(`.y.`, comparison, everything()) %>%
+    group_by(comparison) %>%
+    slice_head(n = 2) %>%
+    ungroup() %>%
+    filter(p.adj < 0.05) %>%
+    arrange(p.adj)
+kable(bt_group_wilcox) %>%
+  kable_styling(bootstrap_options = 'striped')
+```
+
+Latent factor 4 shows the most significant differences between BT groups, so we will investigate this further.
+
+## 4) Characterisation of Latent Factor 4
+
+Factor 4 captures some of the differences in the BT group, showing significant differences between all three groups. 
+We should determine what features drive variation in this factor.
+
+### a) Overview
+
+Firstly we will create a boxplot, density plot, and check differences between atopic vs. non-atopic samples.
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+  rownames_to_column(var = 'Subject_ID') %>%
+  left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+              rownames_to_column(var = 'Subject_ID'),
+            by = 'Subject_ID') %>%
+  left_join(read_csv(here('input', '00_Metadata', 'metadata_extra.csv'), col_types = 'cnfffffffffnffnfn'),
+            by = c('Subject_ID', 'Gest_age_birth')) %>%
+  column_to_rownames(var = 'Subject_ID')
+factor_data[factor_data == 'nan'] <- NA
+saveRDS(factor_data, here('input', '00_Metadata', 'factor_data_extra.rds'))
+write_csv(factor_data, here('input', '00_Metadata', 'factor_data_extra.csv'))
+
+# Plot Factor 4 vs. BT group
+(f4_BTgroup_plot <- ggplot(factor_data, aes(x = BT_group, y = Factor4)) +
+    geom_boxplot(aes(fill = BT_group), alpha = 0.6) +
+    geom_dotplot(binaxis = 'y', stackdir = 'center') +
+    scale_fill_manual(values = BT_colours) +
+    guides(fill = 'none') +
+    stat_compare_means(comparisons = list(c(1,2), c(2,3), c(1,3)), size = 3) +
+    theme(text = element_text(size = 8)) +
+    labs(title = 'Factor 4 - BT group') +
+    theme_pubr(base_size = 8))
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'F4_BTgroup_boxplot.pdf'),
+       f4_BTgroup_plot, width = 10.5, height = 16.5, units = 'cm')
+
+# Make a density plot for Factor 4 coloured by BT group
+(f4_density_plot <- ggplot(factor_data, aes(x = Factor4)) +
+   geom_density(aes(fill = BT_group), alpha = 0.5) +
+   scale_fill_manual(values = BT_colours) +
+   labs(title = 'Density plot of BT groups along Factor 4',
+        y = 'Density') +
+   theme_pubr())
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'densityplot_BTgroup_factor4.pdf'),
+       f4_density_plot, width = 18, height = 6, units = 'cm')
+
+# Check measures of atopy
+# 30IU/mL IgE threshold based on prescribing information for omalizumab as previously described (PMID: 31999898)
+(atopy_f4 <- ggplot(atopy_data %>% filter(!is.na(atopy)), aes(x = atopy, y = Factor4)) +
+    geom_boxplot(fill = 'grey90') +
+    geom_dotplot(aes(fill = BT_group), binaxis = 'y', stackdir = 'center', dotsize = 0.5) +
+    stat_compare_means(comparisons = list(c(1,2))) +
+    scale_fill_manual(values = BT_colours) +
+    labs(title = 'Atopy vs. Factor 4') +
+    theme_pubr(x.text.angle = 45)
+)
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'F4_atopy_plot.pdf'), atopy_f4,
+       width = 12, height = 12, units = 'cm')
+```
+
+### b) Differential testing - bio_limma
+
+#### i) HostRNA
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+  rownames_to_column(var = 'Subject_ID') %>%
+  left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+              rownames_to_column(var = 'Subject_ID'),
+            by = 'Subject_ID') %>%
+  column_to_rownames(var = 'Subject_ID') %>%
+  mutate(FactorFour = Factor4)
+
+# Prepare datasets for limma
+rna_dataset <- SummarizedExperiment(assays = MOFA_impute@imputed_data$host_rna$group1)
+rna_dataset@metadata$metadata <- factor_data
+rowData(rna_dataset)$shortname <- rownames(rna_dataset)
+
+# Run bio_limma
+rna_f4_limma <- bio_limma(input_data = rna_dataset,
+                          model_formula_as_string = '~ FactorFour + BT_group + Age_months',
+                          coefficients = 2,
+                          adj_pval_threshold = 0.05,
+                          logFC_threshold = 0.5,
+                          redo_boxplot_stats = TRUE,
+                          use_groups_as_subtitle = TRUE,
+                          force_feature_table_variable = 'BT_group',
+                          plot_output_folder = here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA'),
+                          plot_file_prefix = 'mofa_f4')
+saveRDS(rna_f4_limma, here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA', 'rna_f4_biolimma.rds'))
+```
+
+```{r}
+# Plot new barplot (instead of the one provided by the bio_limma function)
+rna_f4_limma <- readRDS(here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA', 'rna_f4_biolimma.rds'))
+rna_barplot_df <- rna_f4_limma$limma_significant$FactorFour %>%
+  rownames_to_column(var = 'Gene') %>%
+  mutate(sig_colour = -log10(adj.P.Val),
+         direction = ifelse(logFC > 0, 'Disease', 'Health')) %>%
+  group_by(direction) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  arrange(logFC) %>%
+  mutate(Gene = factor(Gene, levels = Gene))
+
+(rna_f4_barplot <- ggplot(rna_barplot_df, aes(x = logFC, y = Gene)) +
+    geom_col(aes(fill = direction)) +
+    scale_fill_npg(name = '-log10(adj. p-value', alpha = 0.8) +
+    labs(title = 'Top Factor-characterising Genes') +
+    theme_pubr())
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA', 'top_f4_genes_barplot.pdf'),
+       rna_f4_barplot, width = 20, height = 16, units = 'cm')
+```
+
+### 2) Bacterial GhostKOALA data
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+  rownames_to_column(var = 'Subject_ID') %>%
+  left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+              rownames_to_column(var = 'Subject_ID'),
+            by = 'Subject_ID') %>%
+  column_to_rownames(var = 'Subject_ID') %>%
+  mutate(FactorFour = Factor4)
+
+# Prepare datasets for limma
+gk_dataset <- SummarizedExperiment(assays = MOFA_impute@imputed_data$bact_gk$group1)
+gk_dataset@metadata$metadata <- factor_data
+rowData(gk_dataset)$shortname <- rownames(gk_dataset)
+
+# Run bio_limma
+gk_f4_limma <- bio_limma(input_data = gk_dataset,
+                         model_formula_as_string = '~ FactorFour + BT_group + Age_months',
+                         coefficients = 2,
+                         adj_pval_threshold = 0.05,
+                         logFC_threshold = 0.25,
+                         redo_boxplot_stats = TRUE,
+                         use_groups_as_subtitle = TRUE, 
+                         feature_plot_dot_colours = 'BT_group',
+                         plot_output_folder = here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA'),
+                         plot_file_prefix = 'mofa_f4')
+saveRDS(gk_f4_limma, here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'bactgk_f4_biolimma.rds'))
+```
+
+```{r}
+# Recover significant features
+gk_f4_limma <- readRDS(here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'bactgk_f4_biolimma.rds'))
+bactgk_f4_limma_sig <- gk_f4_limma$limma_significant$FactorFour
+
+# Prepare summarised data for generation of a new barplot of top features
+bact_barplot_df <- bactgk_f4_limma_sig %>%
+  rownames_to_column(var = 'Feature') %>%
+  mutate(Species = gsub('_.*', '', Feature),
+         direction = ifelse(logFC > 0, 'Disease', 'Health')) %>%
+  group_by(Species, direction) %>%
+  summarise(count = n()) %>% # count the number of DA genes per taxa
+  ungroup() %>%
+  group_by(Species) %>%
+  summarise(direction = direction, count = count, bact_total = sum(count)) %>% # summarise the total counts up and down along Factor 4
+  ungroup() %>%
+  filter(bact_total > 10 & Species != 'Unknown') %>% # Remove rows where the taxonomy is unknown
+  mutate(count = ifelse(direction == 'Disease', count, -count)) %>% # Fix count direction for use along the x-axis of a barplot
+  group_by(Species) %>%
+  mutate(count_diff = sum(count)) %>%
+  mutate(logcount_diff = log(abs(count_diff))) %>% # normalise summed DA gene counts by log-normalisation (some are very large)
+  mutate(logcount_diff = ifelse(count_diff > 0, logcount_diff, -logcount_diff),
+         logcount = ifelse(count > 0, log(abs(count)), -log(abs(count)))) %>%
+  mutate(logcount_midpoint = mean(logcount)) %>% # find the midpoint of changes to determine overall direction of change (mean of 2 values = midpoint)
+  ungroup() %>%
+  arrange(logcount_midpoint) %>% # sort the shifts from highest in health to highest in disease
+  mutate(Species = factor(Species, levels = unique(Species))) %>%
+  dplyr::select(Species, logcount_midpoint) %>%
+  distinct() %>%
+  mutate(direction = ifelse(logcount_midpoint > 0, 'Disease', 'Health')) %>%
+  arrange(logcount_midpoint) %>%
+  mutate(Species = factor(Species, levels = Species))
+
+# Plot new barplot (instead of the one provided by the bio_limma function)
+(gk_f4_taxplot <- ggplot(bact_barplot_df, aes(x = logcount_midpoint, y = Species)) +
+    geom_col(aes(fill = direction)) +
+    scale_fill_npg(name = 'Direction', alpha = 0.8) +
+    labs(title = 'Factor-associated changes in bacterial genes',
+         subtitle = 'Taxa with >10 DE genes (FDR < 0.05; logFC > 0.25)',
+         x = 'log(DE gene count)',
+         y = 'Taxa') +
+    theme_pubr())
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'gk_f4_taxa_barplot.pdf'),
+       gk_f4_taxplot, width = 20, height = 14, units = 'cm')
+
+# Save as an RDS for addition of the transcriptional activity plot (see '03_Metatranscriptomics.Rmd')
+saveRDS(gk_f4_taxplot, here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'gk_f4_taxa_barplot.rds'))
+```
+
+
+
+## 4) Characterisation of Latent Factor 2
+
+Factor 2 captures a lot of variation explained by small molecules, so we should also investigate what this factor explains.
+
+### a) Overview
+
+Firstly we will create a boxplot, density plot, and check differences between atopic vs. non-atopic samples.
+
+```{r}
+# Recover selected MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Recover factor data
+factor_data <- readRDS(here('input', '00_Metadata', 'factor_data_extra.rds'))
+
+# Plot Factor 2 vs. BT group
+(f2_BTgroup_plot <- ggplot(factor_data, aes(x = BT_group, y = Factor2)) +
+    geom_boxplot(aes(fill = BT_group), alpha = 0.6) +
+    geom_dotplot(binaxis = 'y', stackdir = 'center') +
+    scale_fill_manual(values = BT_colours) +
+    guides(fill = 'none') +
+    stat_compare_means(comparisons = list(c(1,2), c(2,3), c(1,3)), size = 3) +
+    theme(text = element_text(size = 8)) +
+    labs(title = 'Factor 2 - BT group') +
+    theme_pubr(base_size = 8))
+ggsave(here('figures', '05_MOFA', '03_Factor2', 'F2_BTgroup_boxplot.pdf'),
+       f2_BTgroup_plot, width = 10.5, height = 16.5, units = 'cm')
+
+# Make a density plot for Factor 2 coloured by BT group
+(f2_density_plot <- ggplot(factor_data, aes(x = Factor2)) +
+   geom_density(aes(fill = BT_group), alpha = 0.5) +
+   scale_fill_manual(values = BT_colours) +
+   labs(title = 'Density plot of BT groups along Factor 2',
+        y = 'Density') +
+   theme_pubr())
+ggsave(here('figures', '05_MOFA', '03_Factor2', 'densityplot_BTgroup_factor2.pdf'),
+       f2_density_plot, width = 18, height = 6, units = 'cm')
+
+# Check measures of atopy
+# 30IU/mL IgE threshold based on prescribing information for omalizumab as previously described (PMID: 31999898)
+(atopy_f2 <- ggplot(atopy_data %>% filter(!is.na(atopy)), aes(x = atopy, y = Factor2)) +
+    geom_boxplot(fill = 'grey90') +
+    geom_dotplot(aes(fill = BT_group), binaxis = 'y', stackdir = 'center', dotsize = 0.5) +
+    stat_compare_means(comparisons = list(c(1,2))) +
+    scale_fill_manual(values = BT_colours) +
+    labs(title = 'Atopy vs. Factor 2') +
+    theme_pubr(x.text.angle = 45)
+)
+ggsave(here('figures', '05_MOFA', '03_Factor2', 'F2_atopy_plot.pdf'), atopy_f2,
+       width = 12, height = 12, units = 'cm')
+```
+
+### b) Differential testing - bio_limma
+
+##### 1) HostRNA
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+  rownames_to_column(var = 'Subject_ID') %>%
+  left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+              rownames_to_column(var = 'Subject_ID'),
+            by = 'Subject_ID') %>%
+  column_to_rownames(var = 'Subject_ID') %>%
+  mutate(FactorTwo = Factor2)
+
+# Prepare datasets for limma
+rna_dataset <- SummarizedExperiment(assays = MOFA_impute@imputed_data$host_rna$group1)
+rna_dataset@metadata$metadata <- factor_data
+rowData(rna_dataset)$shortname <- rownames(rna_dataset)
+
+# Run bio_limma
+rna_f2_limma <- bio_limma(input_data = rna_dataset,
+                          model_formula_as_string = '~ FactorTwo + BT_group + Age_months',
+                          coefficients = 2,
+                          adj_pval_threshold = 0.05,
+                          logFC_threshold = 0.5,
+                          redo_boxplot_stats = TRUE,
+                          use_groups_as_subtitle = TRUE,
+                          force_feature_table_variable = 'BT_group',
+                          plot_output_folder = here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA'),
+                          plot_file_prefix = 'mofa_f2')
+saveRDS(rna_f2_limma, here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA', 'rna_f2_biolimma.rds'))
+
+# Plot new barplot (instead of the one provided by the bio_limma function)
+rna_f2_limma <- readRDS(here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA', 'rna_f2_biolimma.rds'))
+rna_barplot_df <- rna_f2_limma$limma_significant$FactorTwo %>%
+  rownames_to_column(var = 'Gene') %>%
+  mutate(sig_colour = -log10(adj.P.Val),
+         direction = ifelse(logFC > 0, 'Wheeze', 'Control_Asthma')) %>%
+  group_by(direction) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  arrange(logFC) %>%
+  mutate(Gene = factor(Gene, levels = Gene))
+
+(rna_f2_barplot <- ggplot(rna_barplot_df, aes(x = logFC, y = Gene)) +
+    geom_col(aes(fill = direction)) +
+    scale_fill_npg(name = '-log10(adj. p-value', alpha = 0.8) +
+    labs(title = 'Top Factor-characterising Genes') +
+    theme_pubr())
+ggsave(here('figures', '05_MOFA', '03_Factor4', 'hostRNA', 'limmaDA', 'top_f2_genes_barplot.pdf'),
+       rna_f4_barplot, width = 20, height = 16, units = 'cm')
+```

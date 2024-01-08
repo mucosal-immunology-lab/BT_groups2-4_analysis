@@ -1,0 +1,445 @@
+---
+title: "Breathing Together Project - Groups 2-4"
+subtitle: "Small Molecules (Metabolomics and Lipidomics)"
+author: "Matthew Macowan"
+date: "`r format(Sys.time())`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    toc_depth: 4
+---
+
+Copyright (c) 2023, Mucosal Immunology Lab, Monash University, Melbourne, Australia.
+
+# Environment setup
+
+## 1) Load packages
+
+```{r load packages, eval=TRUE, collapse=TRUE, echo=FALSE}
+notebook.name <- '04_SmallMolecules'
+
+# Get R version and OS information
+version$version.string
+version$platform
+
+#devtools::install_github("yogevherz/plotme")
+
+# Load R packages
+pkgs <- c('knitr', 'markdown', 'tidyverse', 'dplyr', 'ggplot2', 'here', 'data.table',
+          'kableExtra', 'pmp', 'SummarizedExperiment', 'S4Vectors')
+
+pacman::p_load(char = pkgs)
+
+for (pkg in pkgs) {
+  print(paste0(pkg, ': ', packageVersion(pkg)))
+}
+
+# Set seed
+set.seed(2)
+
+# Set BT group colours
+bt_cols <- c('2_Preschool_control' = 'darkseagreen3', 
+             '3_Preschool_wheeze' = 'orange3',
+             '4_School_asthma' = 'indianred')
+
+# Load custom scripts
+source(here::here('scripts', 'rotate_df.R'))
+source(here::here('scripts', 'plot_list_to_pdf.R'))
+source(here::here('scripts', 'add_hmdb.R'))
+source(here::here('scripts', 'add_lmsd.R'))
+source(here::here('scripts', 'keep_annotated.R'))
+source(here::here('scripts', 'save_curation_table.R'))
+```
+
+# Import Data
+
+## 1) Metadata
+
+```{r}
+# Load the sample metadata (and set the column data types)
+smallmol_metadata <- read_csv(here('input', '00_Metadata', 'smallmol_metadata.csv'), 
+                                  col_types = 'cncfnnffccnfffffnnfcccccffffffffffffffnfnnnnnnnnnf')
+# Save to RDS file
+saveRDS(smallmol_metadata, here('input', '00_Metadata', 'smallmol_metadata.rds'))
+```
+
+## 2) MS-DIAL outputs
+
+We will load in both the positive and negative ionisation mode height matrices from the MS-DIAL pipeline. We need to remove the MS/MS columns, as these were acquired in a different manner to the other columns.
+
+Then, we can rbind the two tables together after denoting the original ionisation mode in the row names. Because the QC data is incorporated within each feature (row), pmp can pre-process all of our data at once, and normalise the entire dataset.
+
+```{r}
+# Set the base MS-DIAL output folder location
+msdial_path <- here('input', '04_SmallMolecules', '02_LCMS_data_curation')
+```
+
+### i) BAL metabolomics data
+
+```{r}
+# Load metabolomics height data
+metab_bal_pos <- read_csv(here(msdial_path, 'BAL_metabolomics', 'BT_BAL_metab_positive_height.csv'), skip = 4)
+metab_bal_neg <- read_csv(here(msdial_path, 'BAL_metabolomics', 'BT_BAL_metab_negative_height.csv'), skip = 4)
+
+# Remove the MS2 samples (not acquired in the same manner)
+metab_bal_pos <- metab_bal_pos[, !(names(metab_bal_pos) %in% c('MSMS_pos', 'MSMS_neg'))]
+metab_bal_neg <- metab_bal_neg[, !(names(metab_bal_neg) %in% c('MSMS_pos', 'MSMS_neg'))]
+
+# Separate into intensity and information data.frames for the SummarizedExperiment object
+metab_bal_pos_counts <- as.matrix(metab_bal_pos[, c(36:61, 63:69, 71:85)])
+metab_bal_neg_counts <- as.matrix(metab_bal_neg[, c(36:61, 63:69, 71:85)])
+
+metab_bal_pos_info <- metab_bal_pos[, 1:35]
+metab_bal_neg_info <- metab_bal_neg[, 1:35]
+
+# Rename the data to indicate ionisation mode (using the MS-DIAL alignment ID)
+metab_bal_pos_rownames <- paste0(metab_bal_pos_info$`Alignment ID`, '_met_pos')
+metab_bal_neg_rownames <- paste0(metab_bal_neg_info$`Alignment ID`, '_met_neg')
+
+rownames(metab_bal_pos_counts) <- metab_bal_pos_rownames
+rownames(metab_bal_pos_info) <- metab_bal_pos_rownames
+rownames(metab_bal_neg_counts) <- metab_bal_neg_rownames
+rownames(metab_bal_neg_info) <- metab_bal_neg_rownames
+
+# Merge the postive and negative ionisation modes using rbind
+metab_bal_counts <- rbind(metab_bal_pos_counts, metab_bal_neg_counts)
+metab_bal_info <- rbind(metab_bal_pos_info, metab_bal_neg_info)
+
+# Remove extraneous files
+rm(list = c('metab_bal_pos', 'metab_bal_neg', 'metab_bal_pos_counts', 'metab_bal_neg_counts',
+            'metab_bal_pos_info', 'metab_bal_neg_info', 'metab_bal_pos_rownames',
+            'metab_bal_neg_rownames'))
+```
+
+### ii) BAL lipidomics data
+
+```{r}
+# Load metabolomics height data
+lipid_bal_pos <- read_csv(here(msdial_path, 'BAL_lipidomics', 'BT_BAL_lipid_positive_height.csv'), skip = 4)
+lipid_bal_neg <- read_csv(here(msdial_path, 'BAL_lipidomics', 'BT_BAL_lipid_negative_height.csv'), skip = 4)
+
+# Remove the MS2 samples (not acquired in the same manner)
+lipid_bal_pos <- lipid_bal_pos[, !(names(lipid_bal_pos) %in% c('MSMS_pos', 'MSMS_neg'))]
+lipid_bal_neg <- lipid_bal_neg[, !(names(lipid_bal_neg) %in% c('MSMS_pos', 'MSMS_neg'))]
+
+# Separate into intensity and information data.frames for the SummarizedExperiment object
+lipid_bal_pos_counts <- as.matrix(lipid_bal_pos[, c(36:61, 63:69, 71:85)])
+lipid_bal_neg_counts <- as.matrix(lipid_bal_neg[, c(36:61, 63:69, 71:85)])
+
+lipid_bal_pos_info <- lipid_bal_pos[, 1:35]
+lipid_bal_neg_info <- lipid_bal_neg[, 1:35]
+
+# Rename the data to indicate ionisation mode (using the MS-DIAL alignment ID)
+lipid_bal_pos_rownames <- paste0(lipid_bal_pos_info$`Alignment ID`, '_lip_pos')
+lipid_bal_neg_rownames <- paste0(lipid_bal_neg_info$`Alignment ID`, '_lip_neg')
+
+rownames(lipid_bal_pos_counts) <- lipid_bal_pos_rownames
+rownames(lipid_bal_pos_info) <- lipid_bal_pos_rownames
+rownames(lipid_bal_neg_counts) <- lipid_bal_neg_rownames
+rownames(lipid_bal_neg_info) <- lipid_bal_neg_rownames
+
+# Merge the postive and negative ionisation modes using rbind
+lipid_bal_counts <- rbind(lipid_bal_pos_counts, lipid_bal_neg_counts)
+lipid_bal_info <- rbind(lipid_bal_pos_info, lipid_bal_neg_info)
+
+# Remove extraneous files
+rm(list = c('lipid_bal_pos', 'lipid_bal_neg', 'lipid_bal_pos_counts', 'lipid_bal_neg_counts',
+            'lipid_bal_pos_info', 'lipid_bal_neg_info', 'lipid_bal_pos_rownames',
+            'lipid_bal_neg_rownames'))
+```
+
+### iii) Merge metabolomics and lipidomics data together
+
+Just as we merged the positive and negative ionisation modes for the metabolomics and lipidomics data individually, we will now merge both into a single small molecule dataset for combined normalisation. 
+
+```{r}
+# Check that the column names match
+identical(colnames(metab_bal_counts), colnames(lipid_bal_counts))
+
+# Merge the metabolomics and lipidomics data
+smallmol_counts <- rbind(metab_bal_counts, lipid_bal_counts)
+smallmol_counts <- data.frame(smallmol_counts)  %>%
+  mutate(across(.cols = everything(), .fns = as.numeric)) %>%
+  as.matrix()
+smallmol_info <- rbind(metab_bal_info, lipid_bal_info)
+
+# Remove extraneous files
+rm(list = c('metab_bal_counts', 'metab_bal_info', 'lipid_bal_counts', 'lipid_bal_info'))
+```
+
+### iv) Import data into SummarizedExperiment
+
+Now that we have our intensity and feature information datasets, before we can import them into a SummarizedExperiment object, we need to define class and group vectors so that pmp knows whether our variables are samples, QCs, or blanks.
+
+The easiest way to achieve this is by getting the first two characters (a substring) of our column names, and using these as indicators of the classes: 'Bl' = blank, 'QC' = QC etc.
+
+```{r}
+# Retrieve metadata
+smallmol_metadata <- readRDS(here('input', '00_Metadata', 'smallmol_metadata.rds'))
+
+# Create class and group vectors
+smallmol_class <- substr(colnames(smallmol_counts), start = 1, stop = 2)
+smallmol_group <- substr(colnames(smallmol_counts), start = 1, stop = 2)
+
+# Reorder the metadata rows so that they match the column order of samples in the counts data.frame (ignoring blanks and QCs)
+rownames(smallmol_metadata) <- smallmol_metadata$LCMS_ID
+smallmol_metadata <- smallmol_metadata[colnames(smallmol_counts),]
+rownames(smallmol_metadata) <- smallmol_metadata$LCMS_ID
+
+# Check that the metadata matches the samples
+identical(rownames(smallmol_metadata), colnames(smallmol_counts))
+
+# Create the SummarizedExperiment (SE) object
+smallmol_SE <- SummarizedExperiment(assays = list(counts = smallmol_counts),
+                                    metadata = list(smallmol_metadata),
+                                    rowData = list(info = smallmol_info),
+                                    colData = DataFrame(class = smallmol_class))
+```
+
+# Data pre-processing
+
+## 1) Filtering and normalisation
+
+### i) Filtering
+
+The first filtering steps we will carry out are to replace any so-called "missing" values (i.e. 0 values) with NA so they will be compatible with downstream filtering steps.
+
+After this, we can filter peaks based on the intensity values of our blanks.
+
+```{r}
+# Check the original number of features
+(dim0 <- dim(smallmol_SE))
+
+# Replace missing values with NA to be compatible with downstream filtering
+assay(smallmol_SE) <- replace(assay(smallmol_SE), assay(smallmol_SE) == 0, NA)
+
+# Filter peaks and optionally samples based on blanks
+smallmol_filt <- filter_peaks_by_blank(df = smallmol_SE,
+                                       fold_change = 5, # 5-fold change
+                                       classes = smallmol_SE$class,
+                                       remove_samples = TRUE,
+                                       remove_peaks = TRUE,
+                                       blank_label = 'Bl') # from the class vector
+                                           
+# Check the number of features/samples remaining
+(dim1 <- dim(smallmol_filt))
+```
+
+Next, we can perform a few filtering steps based on missing values and degree of variation in the QC samples.
+
+* filter_samples_by_mv: removal of samples containing a user-defined maximum percentage of missing values see documentation.
+* filter_peaks_by_fraction: removal of peaks based upon the relative proportion of samples containing non-missing values see documentation.
+* filter_peaks_by_rsd: removal of peaks based upon relative standard deviation of intensity values for a given feature within specified QC samples see documentation.
+
+```{r}
+# Filter samples based on the percentage of missing values
+smallmol_filt <- filter_samples_by_mv(df = smallmol_filt,
+                                      max_perc_mv = 0.8)
+                                         
+# Check the number of features/samples
+(dim2 <- dim(smallmol_filt))
+
+# Filter peaks based on missing values across all samples
+smallmol_filt <- filter_peaks_by_fraction(df = smallmol_filt,
+                                          min_frac = 0.8,
+                                          classes = smallmol_filt$class,
+                                          method = 'across')
+
+# Check the number of features/samples
+(dim3 <- dim(smallmol_filt))
+
+# Filter peaks based on the percentage of variation in the QC samples
+smallmol_filt <- filter_peaks_by_rsd(df = smallmol_filt,
+                                     max_rsd = 25,
+                                     classes = smallmol_filt$class,
+                                     qc_label = 'QC')
+
+# Check the number of features/samples
+(dim4 <- dim(smallmol_filt))
+```
+
+### ii) PQN normalisation and glog scaling
+
+```{r}
+# PQN data normalisation
+smallmol_norm <- pqn_normalisation(df = smallmol_filt,
+                                   classes = smallmol_filt$class,
+                                   qc_label = 'QC')
+                                      
+# Missing values imputation
+smallmol_imp <- mv_imputation(df = smallmol_norm,
+                              rowmax = 0.7, # max % of missing data allowed in any row
+                              colmax = 0.7, # max % of missing data allowed in any column
+                              method = 'rf') # or rf, bcpa, sv, mn, md.
+                                 
+# Data scaling
+smallmol_glog <- glog_transformation(df = smallmol_imp,
+                                     classes = smallmol_imp$class,
+                                     qc_label = 'QC')
+
+opt_lambda_stool <- processing_history(smallmol_glog)$glog_transformation$lambda_opt
+
+glog_plot_optimised_lambda(df = smallmol_imp,
+                           optimised_lambda = opt_lambda_stool,
+                           classes = smallmol_imp$class,
+                           qc_label = 'QC')
+
+# Save file
+saveRDS(smallmol_glog, here(msdial_path, 'BAL_smallmol', 'smallmol_glog.rds'))
+```
+
+### iii) PCoA
+
+```{r}
+# Perform the PCA and retrieve the explained variance values
+PCA <- prcomp(t(assay(smallmol_glog)), center = TRUE)
+varexp <- c(summary(PCA)$importance[2,1]*100,
+            summary(PCA)$importance[2,2]*100)
+
+# Create a dataset for plotting
+data_PCA <- cbind(data.frame(Samples = rownames(PCA$x),
+                             PC1 = PCA$x[,1],
+                             PC2 = PCA$x[,2]),
+                  class = smallmol_glog$class)
+
+# Plot results
+(PCA_plot <- ggplot(data_PCA, aes(x = PC1, y = PC2)) +
+    geom_point(aes(fill = class, color = factor(class))) +
+    stat_ellipse(aes(fill = class), geom = 'polygon', type = 't', level = 0.9, alpha = 0.2) +
+    labs(title = 'BAL Metabolomics and Lipidomics',
+         x = paste0('PC1 ', round(varexp[1], 2), '%'),
+         y = paste0('PC2 ', round(varexp[2], 2), '%'))
+)
+```
+
+## 2) HMDB database
+
+```{r}
+# Recover the small molecule glog data
+msdial_path <- here('input', '04_SmallMolecules', '02_LCMS_data_curation')
+smallmol_glog <- readRDS(here(msdial_path, 'BAL_smallmol', 'smallmol_glog.rds'))
+
+# Load HMDB database
+hmdb_df <- readRDS(here('assets', 'hmdb_detected_quantified_v4_20210701.rds'))
+
+# Search annotations in HMDB and add to the SE object
+smallmol_glog <- add_hmdb(metab_SE = smallmol_glog,
+                          hmdb = hmdb_df,
+                          mass_tol = 0.002)
+```
+
+## 3) LIPIDMAPS database
+
+```{r}
+# Load LMSD database
+lmsd_df <- readRDS(here('assets', 'LMSD_2022_02_16.rds'))
+
+# Search LMSD annotations
+lmsd_ann_list <- add_lmsd(metab_SE = smallmol_glog,
+                          lmsd = lmsd_df,
+                          mass_tol = 0.002,
+                          cores = 6)
+
+# Confirm rownames match
+identical(rownames(smallmol_glog), rownames(lmsd_ann_list$agg_lmsd_df))
+
+# Add LMSD annotations to the SE object
+lmsd_agg <- lmsd_ann_list$agg_lmsd_df
+rowData(smallmol_glog)$LMSD_NAME <- lmsd_agg$LMSD_NAME
+rowData(smallmol_glog)$LMSD_SYSTEMATIC_NAME <- lmsd_agg$LMSD_SYSTEMATIC_NAME
+rowData(smallmol_glog)$LMSD_ABBREVIATION <- lmsd_agg$LMSD_ABBREVIATION
+rowData(smallmol_glog)$LMSD_CATEGORY <- lmsd_agg$LMSD_CATEGORY
+rowData(smallmol_glog)$LMSD_MAIN_CLASS <- lmsd_agg$LMSD_MAIN_CLASS
+rowData(smallmol_glog)$LMSD_SYNONYMS <- lmsd_agg$LMSD_SYNONYMS
+```
+
+## 4) Generate a consensus (shortname) column
+
+```{r}
+# Run keep_annotated function
+smallmol_anno <- keep_annotated(metab_SE = smallmol_glog)
+
+# Save SummarizedExperiment
+saveRDS(smallmol_anno, here(msdial_path, 'BAL_smallmol', 'smallmol_glog_annotated_only.rds'))
+```
+
+## 5) Manual curation
+
+### i) Save curation table
+
+```{r}
+# Recover annotated SummarizedExperiment
+msdial_path <- here('input', '04_SmallMolecules', '02_LCMS_data_curation')
+smallmol_anno <- readRDS(here(msdial_path, 'BAL_smallmol', 'smallmol_glog_annotated_only.rds'))
+
+# Save curation table
+save_curation_table(smallmol_anno, here(msdial_path, 'BAL_smallmol', 'curation_table.csv'))
+```
+
+### ii) Retrieve curated table and filter
+
+Now that we have gone through and manually curated each of the peaks, we will keep only those with good quality peaks.
+
+```{r}
+# Recover annotated SummarizedExperiment
+msdial_path <- here('input', '04_SmallMolecules', '02_LCMS_data_curation')
+smallmol_anno <- readRDS(here(msdial_path, 'BAL_smallmol', 'smallmol_glog_annotated_only.rds'))
+
+# Read in the curated table
+curated_table <- read_csv(here(msdial_path, 'BAL_smallmol', 'curated_table.csv'))
+
+# Filter the annotated SE for quality peaks
+smallmol_anno_curated <- smallmol_anno[curated_table$quality_peak,]
+
+# Load LipidLynxX converter names
+lipidlynx_anno <- read_csv(here(msdial_path, 'BAL_smallmol', 'LipidLynxX_converted.csv'))[,-1] %>%
+  distinct()
+
+# Add LipidLynxX converted names to the SE
+lipidlynx <- curated_table %>%
+  filter(quality_peak == 'TRUE') %>%
+  left_join(lipidlynx_anno, by = c('updated_name' = 'Feature')) %>%
+  write_csv(here(msdial_path, 'BAL_smallmol', 'renaming_table.csv'))
+
+# Retrieve renamed data
+renamed_table <- read_csv(here(msdial_path, 'BAL_smallmol', 'renamed_table.csv'), show_col_types = FALSE) %>%
+  dplyr::select(Ionisation, updated_name, best_peak)
+renamed_ordered <- lipidlynx %>%
+  left_join(renamed_table, by = c('Ionisation'))
+
+# Add data to the SE
+rowData(smallmol_anno_curated)$molecule_name <- renamed_ordered$updated_name.y
+rowData(smallmol_anno_curated)$best_peak <- renamed_ordered$best_peak
+
+# Filter for best peak only
+smallmol_anno_curated <- smallmol_anno_curated[rowData(smallmol_anno_curated)$best_peak, ]
+rowData(smallmol_anno_curated)$best_peak <- NULL
+
+# Remove QC samples
+BAL_samples <- str_detect(colnames(smallmol_anno_curated), 'BAL')
+smallmol_anno_curated <- smallmol_anno_curated[, BAL_samples]
+
+# Correct sample names to be the Subject ID
+smallmol_metadata <- readRDS(here('input', '00_Metadata', 'smallmol_metadata.rds')) %>%
+  column_to_rownames(var = 'LCMS_ID')
+sample_names <- smallmol_metadata[colnames(smallmol_anno_curated), ]
+colnames(smallmol_anno_curated) <- sample_names$Subject_ID
+
+# Save SummarizedExperiment
+saveRDS(smallmol_anno_curated, here('input', '04_SmallMolecules', 'smallmol_glog_annotated_curated.rds'))
+```
+
+# Data preparation for MOFA integration
+
+## a) Prepare MOFA counts matrix
+
+```{r}
+# Retrieve processed dataset
+smallmol_SE <- readRDS(here('input', '04_SmallMolecules', 'smallmol_glog_annotated_curated.rds'))
+
+# Extract the assay matrix
+smallmol_matrix <- as.matrix(data.frame(assay(smallmol_SE), row.names = rowData(smallmol_SE)$molecule_name))
+saveRDS(smallmol_matrix, here('input', '05_MOFA', 'smallmol_matrix.rds'))
+```
