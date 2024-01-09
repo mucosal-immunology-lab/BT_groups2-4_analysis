@@ -21,6 +21,7 @@ For context, the groups are as follows:
     - [Correlation analysis between metagenomic and metatranscriptomic data](#correlation-analysis-between-metagenomic-and-metatranscriptomic-data)
   - [4) Bronchoalveolar lavage (BAL) LCMS data processing](#4-bronchoalveolar-lavage-bal-lcms-data-processing)
   - [5) Multi-omic integration with MOFA+](#5-multi-omic-integration-with-mofa)
+    - [Pseudo-bulk analysis](#pseudo-bulk-analysis)
 
 
 ## 1) Host RNA sequencing data processing
@@ -118,3 +119,7 @@ An [R Markdown file](./05_Multiomics.Rmd) of the following steps is provided. Th
 Factors that showed significant differences between patient groups were used as predictors for age-corrected linear modelling on the individual MOFA-imputed datasets using a custom script built around limma (i.e. [`bio_limma`](./scripts/bio_limma.R)). Benjamini-Hochberg multiple testing correction was used with a significance threshold of 0.05. Log fold-change threshold was 0.5 for host RNA and small molecules, and 0.25 for bacterial metagenomics.
 
 To summarise bacterial metagenomic changes following linear modelling, KO functional gene counts were stratified by taxa, filtered for a minimum count of 10, and the log-transformed value of the sum of increased (positive) and decreased (negative) gene counts calculated to determine the net change in gene count abundance per taxa along the MOFA factor.
+
+### Pseudo-bulk analysis
+
+The full integrated human lung cell atlas [single-cell RNA sequencing dataset](https://cellxgene.cziscience.com/collections/6f6d381a-7701-4781-935c-db10d30de293) was downloaded and subsetted to omit cells from individuals with cancer or any smoking history, nasal samples, and cells annotated as ‘native cell’. Gene expression data underwent pseudo-bulk processing by cell type for each study using decoupleR [39]. Mode was set to ‘mean’, with a gene read count threshold of 100 and expression in at least 10 cells. The final dataset was batch-corrected with ComBat_seq [40], and contained 766 profiles, covering 50 cell types from 28 studies. For analysis, data was subsetted to include only multi-omic factor differential genes and used for principal component analysis and biplot generation. Labels around the periphery were added to represent the biplot segment covered by a given cell type from the centre to the extents of 95% confidence ellipses.

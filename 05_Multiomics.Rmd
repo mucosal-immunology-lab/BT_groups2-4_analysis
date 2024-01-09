@@ -220,7 +220,7 @@ Now we have our MultiAssayExperiment, we can actually run MOFA+.
 
 ```{r, eval=FALSE}
 # Set file output name for MOFA object
-mofa_output_filename <- here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+mofa_output_filename <- here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds')
 
 # Run MOFA data integration on the MultiAssayExperiment
 MOFA <- run_MOFA(omics_mae = mofa_mae$omics_mae,
@@ -407,7 +407,7 @@ rna_barplot_df <- rna_f4_limma$limma_significant$FactorFour %>%
          direction = ifelse(logFC > 0, 'Disease', 'Health')) %>%
   group_by(direction) %>%
   arrange(desc(abs(logFC))) %>%
-  slice_head(n = 15) %>%
+  slice_head(n = 25) %>%
   ungroup() %>%
   arrange(logFC) %>%
   mutate(Gene = factor(Gene, levels = Gene))
@@ -421,7 +421,102 @@ ggsave(here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA', 'top_f4_ge
        rna_f4_barplot, width = 20, height = 16, units = 'cm')
 ```
 
-### 2) Bacterial GhostKOALA data
+#### ii) HLCA pseudo-bulk
+
+```{r}
+# Import the pseudobulk data
+hlca_pbulk <- readr::read_csv(here('databases', 'LungCellAtlas', 'data', 'hlca_lung_pseudobulk_mean.csv'))
+colnames(hlca_pbulk)[1] <- 'cell_study'
+hlca_pbulk <- hlca_pbulk %>%
+  mutate(study = str_before_last(cell_study, '_'), # Separate the cell type and study information into separate columns
+         cell = str_after_last(cell_study, '_')) %>%
+  dplyr::select(cell, study, everything()) %>%
+  dplyr::select(-cell_study)
+
+hlca_pbulk_bc <- ComBat_seq(counts = t(hlca_pbulk[, -c(1,2)]), # Perform study-wise batch correction
+                            batch = hlca_pbulk$study)
+hlca_pbulk_bc <- data.frame(t(hlca_pbulk_bc))
+
+hlca_pbulk_bc <- hlca_pbulk_bc %>% # Add back the cell type and study columns to the batch-corrected data
+  mutate(cell = hlca_pbulk$cell,
+         study = hlca_pbulk$study) %>%
+  dplyr::select(cell, study, everything()) # Move cell type and study to the left-most columns
+
+# Filter for Factor 4 genes
+rna_f4_limma <- readRDS(here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA', 'rna_f4_biolimma.rds'))
+rna_f4_sig_genes <- rna_f4_limma$limma_significant$FactorFour
+
+hlca_pbulk_f4 <- hlca_pbulk_bc[, colnames(hlca_pbulk_bc) %in% c('cell', 'study', rna_f4_sig_genes$Gene)]
+
+# Run a PCA
+PCA <- prcomp(hlca_pbulk_f4[, -c(1,2)])
+varexp <- c(summary(PCA)$importance[2,1]*100,summary(PCA)$importance[2,2]*100)
+
+# Prepare a data.frame with the PCA results
+PCA_data <- cbind(data.frame('PC1' = PCA$x[,1],
+                             'PC2' = PCA$x[,2]),
+                  cell = hlca_pbulk_f4$cell,
+                  study = hlca_pbulk_f4$study)
+
+# Prepare a data.frame giving the central coordinates of each cell type
+PCA_data_cell_labels <- PCA_data %>%
+  group_by(cell) %>%
+  summarise(x_mean = mean(PC1),
+            y_mean = mean(PC2))
+
+# Save cell labels to csv to enable grouping of similar cell types
+write_csv(PCA_data_cell_labels, here('figures', '05_MOFA', '02_Factor4',
+                                     'hostRNA', 'limmaDA', 'pseudobulk', 'mean_PCA_celltypes.csv'))
+
+# Recover edited csv file
+PCA_data_cell_labels <- readr::read_csv(here('figures', '05_MOFA', '02_Factor4',
+                                             'hostRNA', 'limmaDA', 'pseudobulk', 'mean_PCA_celltypes_edited.csv'))
+
+# Add these new labels to the main PCA data.frame
+PCA_data <- PCA_data %>%
+  left_join(PCA_data_cell_labels)
+
+# Extract the matrix of variable loadings (eigenvectors)
+datapc <- data.frame(gene=rownames(PCA$rotation), PCA$rotation)
+
+# Determine a suitable multiplier for fitting eigenvectors in the PCA plot space
+mult <- min(
+  (max(PCA_data[,'PC2']) - min(PCA_data[,'PC2'])/(max(datapc[,'PC2'])-min(datapc[,'PC2']))),
+  (max(PCA_data[,'PC1']) - min(PCA_data[,'PC1'])/(max(datapc[,'PC1'])-min(datapc[,'PC1']))))
+
+# Prepare the eigen data using the multipler above
+data_eigen <- transform(datapc,
+                        v1 = 1.2 * mult * (get('PC1')),
+                        v2 = 1.2 * mult * (get('PC2'))) %>%
+  dplyr::select(gene, PC1, PC2, v1, v2) %>%
+  filter(abs(v1) > 0.5 | abs(v2) > 0.5) %>%
+  left_join(rna_f4_sig_gene_differences, by = c('gene' = 'Gene')) %>%
+  mutate(direction = ifelse(logFC > 0, 'disease', 'health'))
+
+# Plot the results
+PCA_plot <- ggplot(PCA_data, aes(x = PC1, y = PC2)) +
+  stat_ellipse(geom = 'polygon', type = 't', level = 0.9, alpha = 0.1, aes(fill = cell_group)) +
+  geom_point(aes(fill = cell_group, colour = cell_group), size = 2, shape = 21, alpha = 1) +
+  labs(title = 'HCLA - Pseudobulk',
+       x = paste0('PC1 ', round(varexp[1]), '%'),
+       y = paste0('PC2 ', round(varexp[2]), '%')) +
+  geom_text(aes(label = cell_group, x = x_mean, y = y_mean), data = PCA_data_cell_labels, inherit.aes = FALSE, size = 2.5) + 
+  coord_equal() + 
+  geom_text(data = data_eigen, 
+            aes(x = v1, y = v2, label = gene), 
+            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey40')) +
+  geom_segment(data = data_eigen, inherit.aes = FALSE,
+               aes(x = 0, y = 0, xend = v1, yend = v2), 
+               alpha=0.75, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey70')) +
+  theme_pubr(legend = 'bottom')
+
+# Save the PCA biplot
+ggsave(here('figures', '05_MOFA', '02_Factor4', 'hostRNA', 'limmaDA',
+            'pseudobulk', 'factor4_pseudobulk_mean_PCA.pdf'), 
+       PCA_plot, width = 32, height = 32, units = 'cm')
+```
+
+#### iii) Bacterial GhostKOALA data
 
 ```{r}
 # Recover MOFA
@@ -505,8 +600,6 @@ ggsave(here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'gk
 saveRDS(gk_f4_taxplot, here('figures', '05_MOFA', '02_Factor4', 'bactGhostKOALA', 'limmaDA', 'gk_f4_taxa_barplot.rds'))
 ```
 
-
-
 ## 4) Characterisation of Latent Factor 2
 
 Factor 2 captures a lot of variation explained by small molecules, so we should also investigate what this factor explains.
@@ -562,7 +655,7 @@ ggsave(here('figures', '05_MOFA', '03_Factor2', 'F2_atopy_plot.pdf'), atopy_f2,
 
 ### b) Differential testing - bio_limma
 
-##### 1) HostRNA
+#### i) HostRNA
 
 ```{r}
 # Recover MOFA
@@ -595,7 +688,9 @@ rna_f2_limma <- bio_limma(input_data = rna_dataset,
                           plot_output_folder = here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA'),
                           plot_file_prefix = 'mofa_f2')
 saveRDS(rna_f2_limma, here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA', 'rna_f2_biolimma.rds'))
+```
 
+```{r}
 # Plot new barplot (instead of the one provided by the bio_limma function)
 rna_f2_limma <- readRDS(here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA', 'rna_f2_biolimma.rds'))
 rna_barplot_df <- rna_f2_limma$limma_significant$FactorTwo %>%
@@ -604,7 +699,7 @@ rna_barplot_df <- rna_f2_limma$limma_significant$FactorTwo %>%
          direction = ifelse(logFC > 0, 'Wheeze', 'Control_Asthma')) %>%
   group_by(direction) %>%
   arrange(desc(abs(logFC))) %>%
-  slice_head(n = 15) %>%
+  slice_head(n = 25) %>%
   ungroup() %>%
   arrange(logFC) %>%
   mutate(Gene = factor(Gene, levels = Gene))
@@ -616,4 +711,159 @@ rna_barplot_df <- rna_f2_limma$limma_significant$FactorTwo %>%
     theme_pubr())
 ggsave(here('figures', '05_MOFA', '03_Factor4', 'hostRNA', 'limmaDA', 'top_f2_genes_barplot.pdf'),
        rna_f4_barplot, width = 20, height = 16, units = 'cm')
+```
+
+#### ii) HLCA pseudo-bulk
+
+```{r}
+# Import the pseudobulk data
+hlca_pbulk <- readr::read_csv(here('databases', 'LungCellAtlas', 'data', 'hlca_lung_pseudobulk_mean.csv'))
+colnames(hlca_pbulk)[1] <- 'cell_study'
+hlca_pbulk <- hlca_pbulk %>%
+  mutate(study = str_before_last(cell_study, '_'), # Separate the cell type and study information into separate columns
+         cell = str_after_last(cell_study, '_')) %>%
+  dplyr::select(cell, study, everything()) %>%
+  dplyr::select(-cell_study)
+
+hlca_pbulk_bc <- ComBat_seq(counts = t(hlca_pbulk[, -c(1,2)]), # Perform study-wise batch correction
+                            batch = hlca_pbulk$study)
+hlca_pbulk_bc <- data.frame(t(hlca_pbulk_bc))
+
+hlca_pbulk_bc <- hlca_pbulk_bc %>% # Add back the cell type and study columns to the batch-corrected data
+  mutate(cell = hlca_pbulk$cell,
+         study = hlca_pbulk$study) %>%
+  dplyr::select(cell, study, everything()) # Move cell type and study to the left-most columns
+
+# Filter for Factor 2 genes
+rna_f2_limma <- readRDS(here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA', 'rna_f2_biolimma.rds'))
+rna_f2_sig_genes <- rna_f2_limma$limma_significant$FactorTwo
+
+hlca_pbulk_f2 <- hlca_pbulk_bc[, colnames(hlca_pbulk_bc) %in% c('cell', 'study', rna_f2_sig_genes$Gene)]
+
+# Run a PCA
+PCA <- prcomp(hlca_pbulk_f4[, -c(1,2)])
+varexp <- c(summary(PCA)$importance[2,1]*100,summary(PCA)$importance[2,2]*100)
+
+# Prepare a data.frame with the PCA results
+PCA_data <- cbind(data.frame('PC1' = PCA$x[,1],
+                             'PC2' = PCA$x[,2]),
+                  cell = hlca_pbulk_f4$cell,
+                  study = hlca_pbulk_f4$study)
+
+# Prepare a data.frame giving the central coordinates of each cell type
+PCA_data_cell_labels <- PCA_data %>%
+  group_by(cell) %>%
+  summarise(x_mean = mean(PC1),
+            y_mean = mean(PC2))
+
+# Save cell labels to csv to enable grouping of similar cell types
+write_csv(PCA_data_cell_labels, here('figures', '05_MOFA', '03_Factor2',
+                                     'hostRNA', 'limmaDA', 'pseudobulk', 'mean_PCA_celltypes.csv'))
+
+# Recover edited csv file
+PCA_data_cell_labels <- readr::read_csv(here('figures', '05_MOFA', '03_Factor2',
+                                             'hostRNA', 'limmaDA', 'pseudobulk', 'mean_PCA_celltypes_edited.csv'))
+
+# Add these new labels to the main PCA data.frame
+PCA_data <- PCA_data %>%
+  left_join(PCA_data_cell_labels)
+
+# Extract the matrix of variable loadings (eigenvectors)
+datapc <- data.frame(gene=rownames(PCA$rotation), PCA$rotation)
+
+# Determine a suitable multiplier for fitting eigenvectors in the PCA plot space
+mult <- min(
+  (max(PCA_data[,'PC2']) - min(PCA_data[,'PC2'])/(max(datapc[,'PC2'])-min(datapc[,'PC2']))),
+  (max(PCA_data[,'PC1']) - min(PCA_data[,'PC1'])/(max(datapc[,'PC1'])-min(datapc[,'PC1']))))
+
+# Prepare the eigen data using the multipler above
+data_eigen <- transform(datapc,
+                        v1 = 1.2 * mult * (get('PC1')),
+                        v2 = 1.2 * mult * (get('PC2'))) %>%
+  dplyr::select(gene, PC1, PC2, v1, v2) %>%
+  filter(abs(v1) > 0.5 | abs(v2) > 0.5) %>%
+  left_join(rna_f4_sig_gene_differences, by = c('gene' = 'Gene')) %>%
+  mutate(direction = ifelse(logFC > 0, 'disease', 'health'))
+
+# Plot the results
+PCA_plot <- ggplot(PCA_data, aes(x = PC1, y = PC2)) +
+  stat_ellipse(geom = 'polygon', type = 't', level = 0.9, alpha = 0.1, aes(fill = cell_group)) +
+  geom_point(aes(fill = cell_group, colour = cell_group), size = 2, shape = 21, alpha = 1) +
+  labs(title = 'HCLA - Pseudobulk',
+       x = paste0('PC1 ', round(varexp[1]), '%'),
+       y = paste0('PC2 ', round(varexp[2]), '%')) +
+  geom_text(aes(label = cell_group, x = x_mean, y = y_mean), data = PCA_data_cell_labels, inherit.aes = FALSE, size = 2.5) + 
+  coord_equal() + 
+  geom_text(data = data_eigen, 
+            aes(x = v1, y = v2, label = gene), 
+            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey40')) +
+  geom_segment(data = data_eigen, inherit.aes = FALSE,
+               aes(x = 0, y = 0, xend = v1, yend = v2), 
+               alpha=0.75, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey70')) +
+  theme_pubr(legend = 'bottom')
+
+# Save the PCA biplot
+ggsave(here('figures', '05_MOFA', '03_Factor2', 'hostRNA', 'limmaDA',
+            'pseudobulk', 'factor2_pseudobulk_mean_PCA.pdf'), 
+       PCA_plot, width = 32, height = 32, units = 'cm')
+```
+
+#### iii) Small molecules
+
+```{r}
+# Recover MOFA
+MOFA <- readRDS(here('output', '05_MOFA', '01_MOFArun', 'MOFA_output.rds'))
+MOFA_impute <- impute(MOFA)
+
+# Get factor data
+factor_data <- data.frame(MOFA2::get_factors(MOFA_impute)$group1) %>%
+  rownames_to_column(var = 'Subject_ID') %>%
+  left_join(data.frame(MOFA@samples_metadata, row.names = samples_names(MOFA)$group1) %>%
+              rownames_to_column(var = 'Subject_ID'),
+            by = 'Subject_ID') %>%
+  column_to_rownames(var = 'Subject_ID') %>%
+  mutate(FactorTwo = Factor2)
+
+# Prepare datasets for limma
+smallmol_assay <- as.matrix(data.frame(MOFA_impute@data$small_mol$group1) %>% dplyr::select(factor2_data$sample))
+smallmol_dataset <- SummarizedExperiment(assays = smallmol_assay)
+smallmol_dataset@metadata$metadata <- factor2_data
+rowData(smallmol_dataset)$shortname <- rownames(smallmol_dataset)
+
+# Run bio_limma
+smallmol_f2_limma <- bio_limma(input_data = smallmol_dataset,
+                              model_formula_as_string = '~ FactorTwo + BT_group + Age_months',
+                              coefficients = 2,
+                              adj_pval_threshold = 0.05,
+                              logFC_threshold = 0.5,
+                              adjust_method = 'BH',
+                              redo_boxplot_stats = TRUE,
+                              use_groups_as_subtitle = TRUE, 
+                              feature_plot_dot_colours = 'BT_group',
+                              plot_output_folder = here('figures', '05_MOFA', '03_Factor2', 'smallmol', 'limmaDA'),
+                              plot_file_prefix = 'mofa_f2')
+saveRDS(rna_f2_limma, here('figures', '05_MOFA', '03_Factor2', 'smallmol', 'limmaDA', 'smallmol_f2_biolimma.rds'))
+```
+
+```{r}
+# Plot new barplot (instead of the one provided by the bio_limma function)
+smallmol_f2_limma <- readRDS(here('figures', '05_MOFA', '03_Factor2', 'smallmol', 'limmaDA', 'smallmol_f2_biolimma.rds'))
+smallmol_barplot_df <- smallmol_f2_limma$limma_significant$FactorTwo %>%
+  rownames_to_column(var = 'smallmol') %>%
+  mutate(sig_colour = -log10(adj.P.Val),
+         direction = ifelse(logFC > 0, 'Wheeze', 'Control_Asthma')) %>%
+  group_by(direction) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 25) %>%
+  ungroup() %>%
+  arrange(logFC) %>%
+  mutate(smallmol = factor(smallmol, levels = smallmol))
+
+(smallmol_f2_barplot <- ggplot(smallmol_barplot_df, aes(x = logFC, y = smallmol)) +
+    geom_col(aes(fill = direction)) +
+    scale_fill_npg(name = '-log10(adj. p-value', alpha = 0.8) +
+    labs(title = 'Top Factor-characterising Small Molecules') +
+    theme_pubr())
+ggsave(here('figures', '05_MOFA', '03_Factor4', 'smallmol', 'limmaDA', 'top_f2_smallmol_barplot.pdf'),
+       smallmol_f2_barplot, width = 20, height = 16, units = 'cm')
 ```
