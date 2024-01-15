@@ -60,7 +60,7 @@ cp ../sunbeam_output/assembly/coassembly/all_final_contigs.fa .
 anvi-script-reformat-fasta all_final_contigs.fa -o contigs-fixed.fa -l 500 --simplify-names
 ```
 
-Individual FASTQ files were aligned and mapped to the co-assembly using a [custom script](./map_contigs.sh) built around [bowtie2](https://github.com/BenLangmead/bowtie2). Per-sample contig counts generated using a second [custom bash script](./scripts/contig_counts.sh).
+Individual FASTQ files were aligned and mapped to the co-assembly using a [custom script](./scripts/map_contigs.sh) built around [bowtie2](https://github.com/BenLangmead/bowtie2). Per-sample contig counts generated using a second [custom bash script](./scripts/contig_counts.sh).
 
 ```bash
 # Build a bowtie2 index from the co-assembly
