@@ -504,10 +504,10 @@ PCA_plot <- ggplot(PCA_data, aes(x = PC1, y = PC2)) +
   coord_equal() + 
   geom_text(data = data_eigen, 
             aes(x = v1, y = v2, label = gene), 
-            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey40')) +
+            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'disease', '#964091', 'grey40')) +
   geom_segment(data = data_eigen, inherit.aes = FALSE,
                aes(x = 0, y = 0, xend = v1, yend = v2), 
-               alpha=0.75, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey70')) +
+               alpha=0.75, colour = ifelse(data_eigen$direction == 'disease', '#964091', 'grey70')) +
   theme_pubr(legend = 'bottom')
 
 # Save the PCA biplot
@@ -783,7 +783,7 @@ data_eigen <- transform(datapc,
   dplyr::select(gene, PC1, PC2, v1, v2) %>%
   filter(abs(v1) > 0.5 | abs(v2) > 0.5) %>%
   left_join(rna_f4_sig_gene_differences, by = c('gene' = 'Gene')) %>%
-  mutate(direction = ifelse(logFC > 0, 'disease', 'health'))
+  mutate(direction = ifelse(logFC > 0, 'wheeze', 'control_asthma'))
 
 # Plot the results
 PCA_plot <- ggplot(PCA_data, aes(x = PC1, y = PC2)) +
@@ -796,10 +796,10 @@ PCA_plot <- ggplot(PCA_data, aes(x = PC1, y = PC2)) +
   coord_equal() + 
   geom_text(data = data_eigen, 
             aes(x = v1, y = v2, label = gene), 
-            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey40')) +
+            size = 2.5, vjust=1, colour = ifelse(data_eigen$direction == 'wheeze', '#964091', 'grey40')) +
   geom_segment(data = data_eigen, inherit.aes = FALSE,
                aes(x = 0, y = 0, xend = v1, yend = v2), 
-               alpha=0.75, colour = ifelse(data_eigen$direction == 'up', '#964091', 'grey70')) +
+               alpha=0.75, colour = ifelse(data_eigen$direction == 'wheeze', '#964091', 'grey70')) +
   theme_pubr(legend = 'bottom')
 
 # Save the PCA biplot
